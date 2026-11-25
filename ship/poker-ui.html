@@ -28,6 +28,9 @@
   button.quiet { background:transparent; color:var(--ink); border:1px solid var(--line); }
   button.fold { background:transparent; color:var(--bad); border:1px solid var(--bad); }
   button:disabled { opacity:.5; cursor:default; }
+  #account { margin-bottom:8px; overflow-wrap:anywhere; }
+  #account button { margin-left:8px; padding:3px 8px; }
+  #you a { color:var(--accent); font-weight:600; }
 
   #table { position:relative; width:100%; aspect-ratio: 16 / 10; min-height:360px; background:var(--felt); border:12px solid var(--rail); border-radius:999px; }
   #center { position:absolute; left:50%; top:45%; transform:translate(-50%, -50%); text-align:center; color:var(--felt-ink); width:62%; }
@@ -92,6 +95,7 @@
   <div>
     <div class="panel">
       <h2>You</h2>
+      <div id="account" hidden><span id="ship"></span><button id="logout" class="quiet">Sign out</button></div>
       <div id="you"></div>
     </div>
     <div class="panel">
@@ -105,7 +109,7 @@
     </div>
     <div class="panel">
       <h2>How this works</h2>
-      <div class="hint">Open this page in another tab or on another device to add a player. The ship sends each browser only that player's two cards. Blinds are 5 and 10; everyone starts with 1,000.</div>
+      <div class="hint"><span id="how-to-join">Open this page in another tab or on another device to add a player.</span> The ship sends each browser only that player's two cards. Blinds are 5 and 10; everyone starts with 1,000.</div>
       <div class="hint" style="margin-top:6px">Before each hand the ship publishes a fingerprint of a secret it has already chosen. Your browser then adds a random number of its own. The deck is worked out from both by a public recipe. After the hand the ship reveals the secret and your browser redoes the shuffle to check it. The ship cannot pick or change the deck. It can still see it.</div>
     </div>
   </div>
@@ -113,14 +117,18 @@
 <script>
 const $ = id => document.getElementById(id);
 const SUIT = { c: '♣', d: '♦', h: '♥', s: '♠' };
+const hostingLogin = false;
+let ship, polling = false, sessionRevision = 0;
 let token = null;
-try { token = sessionStorage.getItem('poker-token'); } catch (e) {}
-if (!token) {
-  token = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
-  try { sessionStorage.setItem('poker-token', token); } catch (e) {}
+if (!hostingLogin) {
+  try { token = sessionStorage.getItem('poker-token'); } catch (e) {}
+  if (!token) {
+    token = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
+    try { sessionStorage.setItem('poker-token', token); } catch (e) {}
+  }
 }
 let version = -1, view = null, sending = false, lastMs = 0, raiseTo = null, raiseHand = -1;
-const mine = {};   // per hand number: what this browser saw for itself (fingerprint, its number, its cards, the board)
+let mine = {};   // per hand number: what this browser saw for itself (fingerprint, its number, its cards, the board)
 
 /*VERIFY-BEGIN*/
 // Everything needed to check a hand, with no help from the ship. The recipe is the one in the
@@ -191,26 +199,48 @@ function checkProof(proof, seen) {
 }
 /*VERIFY-END*/
 
+function setShip(next) {
+  if (ship === next) return;
+  ship = next; sessionRevision++;
+  version = -1; view = null; mine = {}; raiseTo = null; raiseHand = -1;
+  $('account').hidden = !ship;
+  $('ship').textContent = ship || '';
+  delete $('proof').dataset.hand;
+  $('proof').replaceChildren();
+  render();
+}
 async function post(path, body) {
+  const revision = sessionRevision;
   const t = performance.now();
   const r = await fetch(path, { method: 'POST', body });
+  if (hostingLogin && r.status === 401 && revision === sessionRevision) setShip(null);
+  if (!r.ok) throw new Error(hostingLogin && r.status === 401 ? 'Sign in with Tlon to play.' : 'The ship did not answer.');
   const j = await r.json(); lastMs = performance.now() - t;
   return j;
+}
+function move(req) {
+  return post('/poker/api', JSON.stringify(hostingLogin ? req : { token, ...req }));
 }
 async function send(req) {
   if (sending) return; sending = true; $('err').textContent = '';
   try {
-    const a = await post('/poker/api', JSON.stringify(Object.assign({ token }, req)));
+    const a = await move(req);
     if (!a.ok) $('err').textContent = a.error.charAt(0).toUpperCase() + a.error.slice(1) + '.';
     $('meter').textContent = 'last move ' + lastMs.toFixed(0) + ' ms round trip';
-  } catch (e) { $('err').textContent = 'The ship did not answer.'; }
+  } catch (e) { $('err').textContent = e.message; }
   sending = false; poll();
 }
 async function poll() {
+  if (polling) return;
+  polling = true;
+  const revision = sessionRevision;
   try {
-    const p = await post('/poker/poll', token);
+    const p = await post('/poker/poll', hostingLogin ? '' : token);
+    if (revision !== sessionRevision) return;
+    if (hostingLogin && 'ship' in p) setShip(p.ship);
     if (p.v !== version) { version = p.v; view = p.view; render(); }
   } catch (e) { $('meter').textContent = 'ship not reachable'; }
+  finally { polling = false; }
 }
 
 function cardEl(name, big) {
@@ -251,7 +281,7 @@ function fair(v) {
     if (m.commit !== n.commit) m.changed = true;
     if (seated && !m.seed && !n.seeded[v.you]) {
       m.seed = hexOf(crypto.getRandomValues(new Uint8Array(16))); m.seat = v.you;
-      post('/poker/api', JSON.stringify({ op: 'seed', token, seed: m.seed })).then(poll, () => { m.seed = null; });
+      move({ op: 'seed', seed: m.seed }).then(poll, () => { m.seed = null; });
     }
   }
   if (v.stage !== 'idle') {
@@ -299,8 +329,20 @@ function seatEl(s, i, k, v) {
 function renderYou(v) {
   const box = $('you'); box.replaceChildren();
   const seated = v && v.you !== null;
+  if (hostingLogin && !ship) {
+    if (ship === undefined) box.textContent = 'Checking your sign-in…';
+    else box.innerHTML = '<a href="/poker/auth/start">Sign in with Tlon to play</a>';
+    return;
+  }
   if (!seated) {
     const full = v && v.seats.every(Boolean);
+    if (hostingLogin) {
+      const sit = document.createElement('button');
+      sit.textContent = full ? 'Table full' : 'Sit down'; sit.disabled = !!full;
+      sit.onclick = () => send({ op: 'join' });
+      box.append(sit);
+      return;
+    }
     box.innerHTML = '<div style="display:flex;gap:6px"><input type="text" id="name" maxlength="16" placeholder="Your name" style="flex:1;min-width:0"><button id="sit">Sit down</button></div><div class="hint" style="margin-top:6px"></div>';
     box.querySelector('.hint').textContent = full ? 'The table is full. You can watch.' : 'You are watching. Sit down to play.';
     const go = () => send({ op: 'join', name: $('name').value });
@@ -344,7 +386,28 @@ function renderBar(v) {
   }
 }
 
-render(); poll(); setInterval(() => { if (!sending) poll(); }, 600);
+async function start() {
+  render();
+  if (hostingLogin) {
+    $('how-to-join').textContent = 'Sign in with Tlon to play with your ship.';
+    $('logout').onclick = async () => {
+      $('logout').disabled = true;
+      try {
+        const r = await fetch('/poker/auth/logout', { method: 'POST' });
+        if (!r.ok && r.status !== 401) throw new Error();
+        setShip(null); $('err').textContent = ''; poll();
+      } catch { $('err').textContent = 'Could not sign out. Try again.'; }
+      finally { $('logout').disabled = false; }
+    };
+    try {
+      const r = await fetch('/poker/auth/session', { cache: 'no-store' });
+      if (!r.ok) throw new Error();
+      setShip((await r.json()).ship);
+    } catch { setShip(null); }
+  }
+  poll(); setInterval(() => { if (!sending) poll(); }, 600);
+}
+start();
 </script>
 </body>
 </html>

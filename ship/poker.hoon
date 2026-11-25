@@ -19,6 +19,7 @@
 +$  card  card:agent:gall
 +$  seed  seed:lia-sur:wasm-lib
 +$  state-0  [%0 sed=(unit seed) ver=@ud views=(map @t @t)]
++$  state-1  [%1 sed=(unit seed) ver=@ud views=(map @t @t) key-hash=(unit @)]
 ++  spectator  '00000000000000000000000000000000'
 ++  new-seed
   |=  =bowl:gall
@@ -71,15 +72,17 @@
   [o +.r]
 ::
 ++  give
-  |=  [eyre-id=@ta status=@ud type=@t data=octs]
+  |=  [protected=? eyre-id=@ta status=@ud type=@t data=octs]
   ^-  (list card)
   =/  paths=(list path)  [/http-response/[eyre-id]]~
-  :~  [%give %fact paths %http-response-header !>(`response-header:http`[status ['content-type' type]~])]
+  =/  headers=header-list:http  ~[['content-type' type] ['cache-control' 'no-store']]
+  =?  headers  protected  [['x-poker-protected' '1'] headers]
+  :~  [%give %fact paths %http-response-header !>(`response-header:http`[status headers])]
       [%give %fact paths %http-response-data !>(`(unit octs)`[~ data])]
       [%give %kick paths ~]
   ==
 --
-=|  state-0
+=|  state-1
 =*  state  -
 ^-  agent:gall
 |_  =bowl:gall
@@ -93,29 +96,53 @@
 ++  on-load
   |=  old=vase
   ^-  (quip card _this)
-  =/  was  (mole |.(!<(state-0 old)))
-  ?:  &(?=(^ was) ?=(^ sed.u.was))  [~ this(state u.was)]
-  [~ this(sed `(new-seed bowl), ver 0, views ~)]
+  ?:  ?=([%1 *] q.old)
+    [~ this(state !<(state-1 old))]
+  =/  was  !<(state-0 old)
+  ?~  sed.was  [~ this(sed `(new-seed bowl), ver 0, views ~)]
+  [~ this(sed sed.was, ver ver.was, views views.was)]
 ++  on-poke
   |=  [=mark =vase]
   ^-  (quip card _this)
+  ?:  =(%noun mark)
+    ?>  =(src.bowl our.bowl)
+    ::  Local Dojo: :poker &noun [%gateway-key (shax '...')]
+    ::  Only the SHA-256 digest needs to be passed to the ship.
+    =/  conf  ;;([%gateway-key hash=@] q.vase)
+    ?>  &((gth hash.conf 0) (lte (met 0 hash.conf) 256))
+    ?^  key-hash  [~ this(key-hash `hash.conf)]
+    ::  Guest seats cannot carry their unverified names into hosted play.
+    ?>  =(~ (~(del by views) spectator))
+    [~ this(key-hash `hash.conf, sed `(new-seed bowl), ver +(ver), views ~)]
   ?.  ?=(%handle-http-request mark)  (on-poke:def mark vase)
   =+  !<([eyre-id=@ta req=inbound-request:eyre] vase)
+  =/  protected=?  ?=(^ key-hash)
+  =/  authed=?
+    ?~  key-hash  &
+    =/  key  (get-header:http 'x-poker-dealer-key' header-list.request.req)
+    ?~  key  |
+    &((lte (met 3 u.key) 256) =(u.key-hash (shax u.key)))
+  ?.  authed
+    [(give | eyre-id 403 'application/json' (as-octs:mimes:html '{"error":"forbidden"}')) this]
+  =/  reply  (cury give protected)
   =/  url=@t  url.request.req
   =/  body=octs  (fall body.request.req [0 0])
   ?:  ?=(%'GET' method.request.req)
+    ?:  =('/poker/gateway-status' url)
+      =/  out  ?:(protected '{"protected":true}' '{"protected":false}')
+      [(reply eyre-id 200 'application/json' (as-octs:mimes:html out)) this]
     =/  page=@t
       .^(@t %cx /(scot %p our.bowl)/[q.byk.bowl]/(scot %da now.bowl)/bench/poker-ui/html)
-    [(give eyre-id 200 'text/html; charset=utf-8' (as-octs:mimes:html page)) this]
+    [(reply eyre-id 200 'text/html; charset=utf-8' (as-octs:mimes:html page)) this]
   ?:  =('/poker/poll' url)
     =/  mine=@t
       %+  fall  (~(get by views) q.body)
       (fall (~(get by views) spectator) 'null')
     =/  out=@t  (rap 3 ~['{"v":' (crip (a-co:co ver)) ',"view":' mine '}'])
-    [(give eyre-id 200 'application/json' (as-octs:mimes:html out)) this]
+    [(reply eyre-id 200 'application/json' (as-octs:mimes:html out)) this]
   ?:  =('/poker/reset' url)
     :_  this(sed `(new-seed bowl), ver +(ver), views ~)
-    (give eyre-id 200 'application/json' (as-octs:mimes:html '{"ok":true}'))
+    (reply eyre-id 200 'application/json' (as-octs:mimes:html '{"ok":true}'))
   =/  out  (ask (need sed) body eny.bowl)
   =/  lines=wain  (to-wain:format q.-.out)
   ?~  lines  !!
@@ -125,11 +152,11 @@
     |=  line=@t
     [(end [3 32] line) (rsh [3 32] line)]
   :_  this(sed `+.out, ver +(ver), views seen)
-  (give eyre-id 200 'application/json' (as-octs:mimes:html i.lines))
+  (reply eyre-id 200 'application/json' (as-octs:mimes:html i.lines))
 ++  on-watch
   |=  =path
   ^-  (quip card _this)
-  ?:  ?=([%http-response *] path)  `this
+  ?:  ?=([%http-response @ ~] path)  `this
   (on-watch:def path)
 ++  on-leave  on-leave:def
 ++  on-peek   on-peek:def

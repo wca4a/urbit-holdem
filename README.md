@@ -45,6 +45,62 @@ Rules covered: up to 8 seats, blinds of 5 and 10, 1,000 starting chips, minimum
 raises, all-ins, side pots, split pots with odd chips, joining and leaving
 mid-hand, buying back in.
 
+## Play on a website with a Tlon ship
+
+The optional website gateway lets spectators watch and Tlon Hosting users sit as
+a ship they own. **Sign in with Tlon to play** opens the hosting site. If needed,
+the player completes the usual OTP and MFA flow in another tab, returns to the
+consent screen, chooses a ship, and comes back to the table. Signing in again as
+the same ship recovers its seat and chips while the dealer keeps that seat.
+
+This integration includes a small service that **Tlon must mount on its hosting
+origin**. A standalone deployment of the poker website cannot use Tlon's existing
+login page as an identity callback. The game receives a one-time code and a ship
+name. The OTP, hosting cookie, account profile and ship access code stay outside
+the game. The poker seat token stays between the website gateway and the dealer.
+
+### Run the hosted table
+
+Use Node 22 or newer. Both services use Node built-ins. Configure three
+independent secrets (for example, generate each with `openssl rand -hex 32`)
+in the service environment.
+
+| Setting | Where | Value |
+| --- | --- | --- |
+| `GAME_ORIGIN` | Both services | Public HTTPS origin of the poker website, on a separate hostname from Tlon Hosting |
+| `BRIDGE_ORIGIN` | Both services | Horizon's HTTPS origin, where the player ordinarily signs in |
+| `BRIDGE_SECRET` | Both services | Shared secret for redeeming one-time codes |
+| `SOLARIS_ORIGIN` | Bridge | Optional trusted Solaris API origin, defaults to `BRIDGE_ORIGIN` |
+| `DEALER_ORIGIN` | Gateway | Dedicated ship origin (HTTPS, or HTTP on loopback) |
+| `DEALER_KEY` | Gateway | Random secret whose SHA-256 digest is configured on the ship |
+| `SEAT_SECRET` | Gateway | Stable secret used to derive a separate private seat token for each ship |
+
+1. Install the agent, engine and page as described in **Run it on a ship**. Start
+   with an empty table. At the local Dojo, configure the dealer with
+   `:poker &noun [%gateway-key (shax 'YOUR-DEALER-KEY')]`. Use a hex key as above.
+   This locks the dealer's page, API, polling and reset routes to the gateway.
+2. On the Tlon side run `node login/bridge.mjs` behind the **same browser origin
+   as Horizon**. Route `/holdem-auth/authorize`, `/holdem-auth/redeem`,
+   `/v1/holdem-auth/ships` and `/v1/holdem-auth/consent` to its loopback
+   listener (`BRIDGE_PORT`, default 7881). Preserve the existing Horizon
+   `/login` and Solaris `/v1` routes. The two form routes live under `/v1` to
+   receive the hosting cookie. The bridge checks the current-user/MFA guard on
+   `/v1/users/<id>/pending-lures` with HEAD, then reads the owned ship list
+   from the account. It repeats those checks when the player confirms.
+3. Run `node login/gateway.mjs` behind the game website's HTTPS proxy and route
+   the game origin to its loopback listener (`PORT`, default 3000). Open
+   `/poker`. The gateway requires the protected-dealer response before opening
+   play. It exposes no table reset operation.
+4. Use one instance of each Node service. Login state, one-minute exchange codes
+   and twelve-hour website sessions live in memory. After a restart, signing
+   in again recovers a seat if the gateway kept its `SEAT_SECRET`. Keep login
+   query strings and authentication headers out of reverse-proxy logs.
+
+Test the gateway and identity exchange locally with
+`node --test test/bridge.test.mjs test/gateway.test.mjs`. The tests run the
+real services and Wasm engine with simulated Solaris responses. A live OTP
+smoke test requires the hosting-side routes and a test hosting account.
+
 ## The sealed deck
 
 The worry with any online card game is that the house stacks the deck. Here it
@@ -132,7 +188,7 @@ and `test/poker-work.txt` to `<pier>/base/bench/poker-work.txt`.
 
 - No turn timer: if a player walks away mid-hand, the table waits for them.
 - Browsers poll about twice a second; there is no live push.
-- The page is served without login. Fine on a local test ship; think before
+- In standalone mode the page is served without login. Fine on a local test ship; think before
   putting it on a ship that matters.
 - Tested on a local fake ship only.
 
