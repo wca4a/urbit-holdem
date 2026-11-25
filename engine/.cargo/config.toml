@@ -1,0 +1,4 @@
+# urbit/wasm3 misreads a table maximum between 64 and 127 (and similar ranges) as negative and
+# rejects the module. A growable table has no maximum, which sidesteps that.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--growable-table"]
