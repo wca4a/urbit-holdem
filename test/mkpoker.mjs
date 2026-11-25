@@ -28,6 +28,7 @@ while (lines.length < want) {
   if (roll < 5) { send(['{"op":"act","token":', 'not json', '{"op":"fly"}'][rnd(3)]); continue; }
   if (roll < 7) { send({op: 'act', token: seated[rnd(seated.length)], action: ['call', 'check', 'raise'][rnd(3)], amount: rnd(500)}); continue; }  // often out of turn
   for (const t of seated) if (views[t] && views[t].seats[views[t].you].busted) send({op: 'rebuy', token: t});
+  if (spec.stage === 'idle') for (const t of seated) if (views[t] && !views[t].next.seeded[views[t].you] && rnd(10) < 8) send(rnd(20) ? {op: 'seed', token: t, seed: Array.from({length: 32}, () => '0123456789abcdef'[rnd(16)]).join('')} : {op: 'seed', token: t, seed: 'nope'});
   if (spec.stage === 'idle') { send({op: 'deal', token: seated[rnd(seated.length)]}); continue; }
   const t = seated.find(t => views[t].actions); const a = views[t].actions; const pick = rnd(100);
   if (pick < 10) send({op: 'act', token: t, action: 'fold'});

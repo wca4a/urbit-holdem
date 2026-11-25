@@ -4,8 +4,10 @@ A multiplayer Texas hold'em table where the dealer is a Rust program compiled to
 Wasm, running inside an Urbit ship through urwasm (`run:wasm` in `lib/wasm/lia`).
 Players are browser tabs talking to the ship over HTTP. Play chips only.
 
-The ship is the referee. It holds the deck, the chips and the rules, shuffles
-with its own entropy, and sends each browser only that player's two cards.
+The ship is the referee. It holds the deck, the chips and the rules, and sends
+each browser only that player's two cards. Every deck is sealed before the deal
+and opened after the hand, so each player's browser can check for itself that
+the ship did not pick or change the cards.
 
 ## What is here
 
@@ -18,15 +20,16 @@ with its own entropy, and sends each browser only that player's two cards.
 | `ship/replay.hoon` | Generator that feeds a file of recorded requests to the engine on a ship, for testing. |
 | `test/mkpoker.mjs` | Bots play against the engine in Node and record every request they make. |
 | `test/node-ref.mjs` | Replays recorded requests in Node and fingerprints each reply, to compare with a ship. |
+| `test/verify.mjs` | Runs the page's own checking code against hundreds of bot hands, then against tampered proofs. |
 | `test/poker-seat.py` | A seat for a player that is not a browser (a script, or an AI): join, act, and wait for your turn. It only asks the ship for its own token's view. |
 
 ## How it works
 
 The engine has three exports: `request(len)` reserves a buffer, the host writes a
 JSON request into it, `handle(len)` runs it, and `response()` says where the
-reply is. It imports one function, `env.ship_entropy`, which it calls twice per
-deal to seed the shuffle. In urwasm that import blocks: the run stops, the agent
-answers from `eny.bowl`, and the run resumes.
+reply is. It imports one function, `env.ship_entropy`, which it calls four times
+per deal for the secret half of the next shuffle. In urwasm that import blocks:
+the run stops, the agent answers from `eny.bowl`, and the run resumes.
 
 Every reply is a few lines of text:
 
@@ -42,6 +45,41 @@ Rules covered: up to 8 seats, blinds of 5 and 10, 1,000 starting chips, minimum
 raises, all-ins, side pots, split pots with odd chips, joining and leaving
 mid-hand, buying back in.
 
+## The sealed deck
+
+The worry with any online card game is that the house stacks the deck. Here it
+cannot, and each player can check that without trusting the ship.
+
+1. **Seal.** Before a hand, the engine picks a 32-byte secret (from the ship's
+   entropy) and publishes only its SHA-256 fingerprint.
+2. **Everyone adds a number.** Each player's browser sends 16 random bytes of
+   its own. The secret was fixed before these existed, so the ship cannot choose
+   it to suit them; the players never see the secret in time, so they cannot
+   steer the deck either.
+3. **Deal.** The deck order is computed from the secret, the players' numbers
+   and the hand number by a public recipe (`shuffled_deck` in the engine: a
+   SHA-256 keyed stream driving a shuffle with no modulo bias).
+4. **Open.** When the hand is over, the engine publishes the secret, the
+   numbers and the full deck. Each browser checks that the secret matches the
+   fingerprint it saw before the deal, that its own number was used, that the
+   recipe gives exactly that deck, and that its cards and the board came from it.
+
+The recipe is implemented three times, independently: in Rust (the engine), in
+JavaScript with its own SHA-256 (the page, so it also works where browsers
+withhold their built-in crypto, such as plain HTTP on a local network), and in
+Python (`test/poker-seat.py`). They agree on every hand tested.
+
+What this does not do:
+
+- **The ship can still see the cards.** Sealing proves the deck was not chosen
+  or changed; it does not hide it from whoever runs the ship. Removing that
+  needs a dealerless protocol (mental poker), which this is not.
+- **A player colluding with the ship** could send their number last, after the
+  ship has tried many candidates for it. Having players seal their numbers too
+  would close that; it is not done here.
+- A browser that was not watching before a deal cannot check the timing of that
+  hand, and says so.
+
 ## Build and test
 
 ```sh
@@ -51,9 +89,16 @@ cargo build --release --target wasm32-unknown-unknown  # the Wasm program
 cp target/wasm32-unknown-unknown/release/poker.wasm ../poker.wasm
 ```
 
-The native tests check hand ranking, pot splitting, and 20,000 random hands with
-players coming and going: chips are always conserved, the game never gets stuck,
-and no player's view contains another player's cards.
+The native tests check hand ranking, pot splitting, the sealed deck (the
+fingerprint never moves, the secret never shows during a hand, the cards dealt
+are the cards in the opened deck), and 20,000 random hands with players coming
+and going: chips are always conserved, the game never gets stuck, and no
+player's view contains another player's cards.
+
+```sh
+cd test
+node verify.mjs 300      # the page's checker against 300 bot hands, then against six kinds of tampering
+```
 
 To compare a ship against Node:
 
@@ -97,6 +142,7 @@ and `test/poker-work.txt` to `<pier>/base/bench/poker-work.txt`.
   program's function table has a maximum of 102, and urbit/wasm3 rejects it as
   malformed (it reads the table maximum as a signed number). Fix proposed in
   urbit/wasm3 pull request 5.
-- On the runtime as it stands, a move costs about 5 ms of Wasm work and a deal
-  about 11 ms. With the patches on the `urwasm-fast-clean` branch of
-  wca4a/vere, that is about 3 ms and 4 ms.
+- It runs on the runtime as it stands; nothing here needs a patched vere. A
+  move costs about 6 to 7 ms of Wasm work there and a deal about 20 to 25 ms.
+  With the patches on the `urwasm-fast-clean` branch of wca4a/vere, that is
+  about 3.5 ms and 7 ms.

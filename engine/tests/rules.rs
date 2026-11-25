@@ -98,3 +98,52 @@ fn random_play_keeps_every_chip() {
     assert!(t.hand_no >= 20_000);
     let _: Value = t.view(None);
 }
+
+#[test]
+fn sealed_deck() {
+    use sha2::{Digest, Sha256};
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+    let mut t = Table::default();
+    for i in 0..3 { t.handle(Req::Join { token: tok(i), name: format!("p{i}") }).unwrap(); }
+    let mut decks = std::collections::HashSet::new();
+    for hand in 1..=200u32 {
+        let promised = t.view(None)["next"]["commit"].as_str().unwrap().to_string();
+        assert_eq!(t.view(None)["next"]["hand"], hand);
+        assert!(t.handle(Req::Seed { token: tok(0), seed: "xyz".into() }).is_err());
+        for i in 0..3 { t.handle(Req::Seed { token: tok(i), seed: format!("{:032x}", hand as usize * 10 + i) }).unwrap(); }
+        assert_eq!(t.view(None)["next"]["commit"], promised.as_str(), "sending numbers must not move the fingerprint");
+        for s in t.seats.iter().flatten().cloned().collect::<Vec<_>>() { if s.chips == 0 { t.handle(Req::Rebuy { token: s.token }).unwrap(); } }
+        t.handle(Req::Deal { token: tok(0) }).unwrap();
+        let mut holes = vec![];
+        while t.stage() != Stage::Idle {
+            let seat = t.to_act.unwrap();
+            for v in (0..3).map(|i| t.view(Some(i))).chain([t.view(None)]) {
+                assert!(v["proof"].is_null() && !v.to_string().contains("secret"), "the secret is out before the hand is over");
+                assert_eq!(v["sealed"], promised.as_str());
+            }
+            if holes.is_empty() { holes = (0..3).map(|i| t.view(Some(i))["seats"][i]["cards"].clone()).collect(); }
+            let call = t.view(Some(seat))["actions"]["call"].as_u64().unwrap();
+            t.handle(Req::Act { token: tok(seat), action: if call == 0 { "check".into() } else { "call".into() }, amount: None }).unwrap();
+        }
+        let p = t.view(None)["proof"].clone();
+        assert_eq!(p["hand"], hand);
+        assert_eq!(p["commit"], promised.as_str(), "the fingerprint published before the deal is the one opened after it");
+        let secret: Vec<u8> = (0..32).map(|i| u8::from_str_radix(&p["secret"].as_str().unwrap()[2 * i..2 * i + 2], 16).unwrap()).collect();
+        assert_eq!(hex(&Sha256::new().chain_update(b"holdem-commit-v1").chain_update(&secret).finalize()), promised);
+        for i in 0..3 { assert_eq!(p["seeds"][i], format!("{:032x}", hand as usize * 10 + i)); }
+        let mut deck: Vec<String> = p["deck"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+        let mut sorted = deck.clone(); sorted.sort(); sorted.dedup(); assert_eq!(sorted.len(), 52);
+        for seat in p["dealt"].as_array().unwrap() {
+            let got = vec![deck.pop().unwrap(), deck.pop().unwrap()];
+            assert_eq!(serde_json::json!(got), holes[seat.as_u64().unwrap() as usize], "cards dealt are not the cards in the published deck");
+        }
+        let board: Vec<String> = (0..5).map(|_| deck.pop().unwrap()).collect();
+        assert_eq!(serde_json::json!(board), t.view(None)["board"]);
+        assert!(decks.insert(p["deck"].to_string()), "the same deck twice");
+    }
+    // one player's number alone changes the whole deck
+    let s = [7u8; 32]; let mut a: [Vec<u8>; SEATS] = Default::default(); a[2] = vec![1; 16];
+    let mut b = a.clone(); b[2][15] = 2;
+    let (da, db) = (shuffled_deck(&s, 9, &a), shuffled_deck(&s, 9, &b));
+    assert!(da != db && da.iter().zip(&db).filter(|(x, y)| x == y).count() < 12);
+}

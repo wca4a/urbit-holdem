@@ -62,6 +62,11 @@
   #log { font:12.5px/1.5 ui-monospace, Menlo, monospace; margin:0; padding:0; list-style:none; max-height:330px; overflow:auto; }
   #log li.hd { color:var(--accent); margin-top:4px; }
   .hint { color:var(--dim); font-size:12.5px; }
+  #proof { font-size:13px; margin-top:6px; }
+  #proof .good { color:var(--ok); font-weight:600; } #proof .bad { color:var(--bad); font-weight:600; }
+  #proof ul { margin:4px 0 0; padding-left:18px; color:var(--dim); font-size:12.5px; }
+  #proof li.no { color:var(--bad); }
+  code { font:12px ui-monospace, Menlo, monospace; }
 </style>
 </head>
 <body>
@@ -90,12 +95,18 @@
       <div id="you"></div>
     </div>
     <div class="panel">
+      <h2>Fair deal</h2>
+      <div id="seal" class="hint">Waiting for the table.</div>
+      <div id="proof"></div>
+    </div>
+    <div class="panel">
       <h2>Hand log</h2>
       <ul id="log"></ul>
     </div>
     <div class="panel">
       <h2>How this works</h2>
-      <div class="hint">Open this page in another tab or on another device to add a player. The ship shuffles with its own randomness and sends each browser only that player's two cards. Blinds are 5 and 10; everyone starts with 1,000.</div>
+      <div class="hint">Open this page in another tab or on another device to add a player. The ship sends each browser only that player's two cards. Blinds are 5 and 10; everyone starts with 1,000.</div>
+      <div class="hint" style="margin-top:6px">Before each hand the ship publishes a fingerprint of a secret it has already chosen. Your browser then adds a random number of its own. The deck is worked out from both by a public recipe. After the hand the ship reveals the secret and your browser redoes the shuffle to check it. The ship cannot pick or change the deck. It can still see it.</div>
     </div>
   </div>
 </main>
@@ -109,6 +120,76 @@ if (!token) {
   try { sessionStorage.setItem('poker-token', token); } catch (e) {}
 }
 let version = -1, view = null, sending = false, lastMs = 0, raiseTo = null, raiseHand = -1;
+const mine = {};   // per hand number: what this browser saw for itself (fingerprint, its number, its cards, the board)
+
+/*VERIFY-BEGIN*/
+// Everything needed to check a hand, with no help from the ship. The recipe is the one in the
+// engine's `shuffled_deck`; this is a separate implementation of it.
+function sha256(msg) {
+  const K = [], H = [], isPrime = n => { for (let i = 2; i * i <= n; i++) if (n % i === 0) return false; return true; };
+  for (let n = 2; K.length < 64; n++) if (isPrime(n)) { if (H.length < 8) H.push((Math.sqrt(n) % 1) * 4294967296 >>> 0); K.push((Math.cbrt(n) % 1) * 4294967296 >>> 0); }
+  const len = msg.length, total = ((len + 9 + 63) >> 6) << 6, m = new Uint8Array(total), w = new Uint32Array(64);
+  m.set(msg); m[len] = 0x80;
+  const bits = len * 8; m[total - 4] = bits >>> 24; m[total - 3] = bits >>> 16; m[total - 2] = bits >>> 8; m[total - 1] = bits;
+  m[total - 5] = Math.floor(len / 536870912);
+  const rr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let o = 0; o < total; o += 64) {
+    for (let i = 0; i < 16; i++) w[i] = (m[o + 4 * i] << 24) | (m[o + 4 * i + 1] << 16) | (m[o + 4 * i + 2] << 8) | m[o + 4 * i + 3];
+    for (let i = 16; i < 64; i++) { const a = w[i - 15], b = w[i - 2]; w[i] = (w[i - 16] + (rr(a, 7) ^ rr(a, 18) ^ (a >>> 3)) + w[i - 7] + (rr(b, 17) ^ rr(b, 19) ^ (b >>> 10))) >>> 0; }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (h + (rr(e, 6) ^ rr(e, 11) ^ rr(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) >>> 0;
+      const t2 = ((rr(a, 2) ^ rr(a, 13) ^ rr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+  }
+  const out = new Uint8Array(32);
+  H.forEach((x, i) => { out[4 * i] = x >>> 24; out[4 * i + 1] = x >>> 16; out[4 * i + 2] = x >>> 8; out[4 * i + 3] = x; });
+  return out;
+}
+const hexOf = b => Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+const bytesOf = h => Uint8Array.from(h.match(/../g) || [], x => parseInt(x, 16));
+const asciiOf = s => Uint8Array.from(s, c => c.charCodeAt(0));
+const u32le = n => Uint8Array.of(n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255);
+function joinBytes(parts) { const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; } return out; }
+function commitmentOf(secretHex) { return hexOf(sha256(joinBytes([asciiOf('holdem-commit-v1'), bytesOf(secretHex)]))); }
+function deckOf(secretHex, hand, seedsHex) {
+  const parts = [asciiOf('holdem-deck-v1'), bytesOf(secretHex), u32le(hand)];
+  for (const s of seedsHex) { const b = bytesOf(s); parts.push(Uint8Array.of(b.length), b); }
+  const key = sha256(joinBytes(parts));
+  let counter = 0; const ready = [];
+  const next = () => {
+    if (!ready.length) { const blk = sha256(joinBytes([key, u32le(counter++)]));
+      for (let i = 0; i < 4; i++) { let x = 0n; for (let k = 7; k >= 0; k--) x = (x << 8n) | BigInt(blk[8 * i + k]); ready.push(x); } }
+    return ready.shift();
+  };
+  const MAX = (1n << 64n) - 1n, deck = Array.from({ length: 52 }, (_, i) => i);
+  for (let k = 51; k >= 1; k--) { const n = BigInt(k + 1), limit = MAX - (MAX % n); let x; do { x = next(); } while (x >= limit);
+    const j = Number(x % n); [deck[k], deck[j]] = [deck[j], deck[k]]; }
+  return deck.map(c => '23456789TJQKA'[c >> 2] + 'cdhs'[c & 3]);
+}
+// proof: what the ship published after the hand. seen: what this browser saw for itself:
+// {commit: fingerprint shown before the deal or null, seed: the number it sent or null,
+//  seat: its seat or null, cards: its two cards or null, board: the board cards it saw}
+function checkProof(proof, seen) {
+  const lines = [], add = (ok, text) => lines.push({ ok, text });
+  add(commitmentOf(proof.secret) === proof.commit, 'The revealed secret matches the fingerprint');
+  if (seen.commit) add(seen.commit === proof.commit, 'That fingerprint is the one shown before the deal');
+  else add(null, 'You were not watching before this deal, so the timing cannot be checked');
+  if (seen.seed) add(proof.seeds[seen.seat] === seen.seed, 'Your number went into the shuffle');
+  else add(null, 'You did not add a number to this hand');
+  const deck = deckOf(proof.secret, proof.hand, proof.seeds);
+  add(deck.join() === proof.deck.join(), 'The recipe gives exactly the published deck');
+  const d = deck.slice(), hands = {};
+  for (const seat of proof.dealt) hands[seat] = [d.pop(), d.pop()];
+  const board = [d.pop(), d.pop(), d.pop(), d.pop(), d.pop()];
+  if (seen.cards && seen.cards.length === 2) add(hands[seen.seat] && hands[seen.seat].join() === seen.cards.join(), 'Your two cards came from that deck');
+  if (seen.board && seen.board.length) add(board.slice(0, seen.board.length).join() === seen.board.join(), 'The board came from that deck');
+  return { ok: lines.every(l => l.ok !== false), lines };
+}
+/*VERIFY-END*/
 
 async function post(path, body) {
   const t = performance.now();
@@ -149,7 +230,7 @@ function render() {
   if (!v) {
     $('pot').textContent = 'Empty table'; $('stage').textContent = 'Take a seat to start'; $('results').textContent = '';
     for (let k = 0; k < 8; k++) seats.append(seatEl(null, k, k, null));
-    renderYou(null); renderBar(null); return;
+    renderYou(null); renderBar(null); $('seal').textContent = 'Waiting for the table.'; return;
   }
   const me = v.you, base = me === null ? 0 : me;
   for (let k = 0; k < 8; k++) { const i = (base + k) % 8; seats.append(seatEl(v.seats[i], i, k, v)); }
@@ -159,7 +240,41 @@ function render() {
   $('results').textContent = v.stage === 'idle' ? v.results.map(r => r.winners.join(' and ') + ' won ' + r.amount.toLocaleString() + (r.hand ? ' with ' + r.hand.toLowerCase() : '')).join('.  ') : '';
   for (const line of v.log) { const li = document.createElement('li'); li.textContent = line; if (/^Hand \d+:/.test(line)) li.className = 'hd'; $('log').append(li); }
   $('log').scrollTop = $('log').scrollHeight;
-  renderYou(v); renderBar(v);
+  renderYou(v); renderBar(v); fair(v);
+}
+
+// keep our own record of each hand, add our number to the next deck, and check a finished hand
+function fair(v) {
+  const n = v.next, seated = v.you !== null;
+  if (n && n.commit) {
+    const m = mine[n.hand] = mine[n.hand] || { commit: n.commit, seed: null, seat: null, cards: null, board: [], changed: false };
+    if (m.commit !== n.commit) m.changed = true;
+    if (seated && !m.seed && !n.seeded[v.you]) {
+      m.seed = hexOf(crypto.getRandomValues(new Uint8Array(16))); m.seat = v.you;
+      post('/poker/api', JSON.stringify({ op: 'seed', token, seed: m.seed })).then(poll, () => { m.seed = null; });
+    }
+  }
+  if (v.stage !== 'idle') {
+    const m = mine[v.hand] = mine[v.hand] || { commit: null, seed: null, seat: null, cards: null, board: [] };
+    if (seated && v.seats[v.you].cards.length === 2) { m.cards = v.seats[v.you].cards.slice(); m.seat = v.you; }
+    if (v.board.length >= m.board.length) m.board = v.board.slice();
+  }
+  const short = h => h.slice(0, 12);
+  $('seal').textContent = v.sealed ? 'This hand\'s deck was sealed before the deal: ' + short(v.sealed) + '.'
+    : n && n.commit ? 'Deck for hand ' + n.hand + ' is sealed: ' + short(n.commit) + '. ' + (seated ? (n.seeded[v.you] ? 'Your number is in.' : 'Adding your number.') : 'Sit down to add a number of your own.')
+    : 'Waiting for the table.';
+  const box = $('proof');
+  if (!v.proof) { if (v.stage !== 'idle') box.replaceChildren(); return; }
+  if (box.dataset.hand === String(v.proof.hand)) return;
+  const seen = mine[v.proof.hand] || { commit: null, seed: null, seat: null, cards: null, board: [] };
+  const res = checkProof(v.proof, seen);
+  if (seen.changed) { res.ok = false; res.lines.push({ ok: false, text: 'The fingerprint changed before the deal' }); }
+  box.dataset.hand = v.proof.hand; box.replaceChildren();
+  const head = document.createElement('div'); head.className = res.ok ? 'good' : 'bad';
+  head.textContent = res.ok ? 'Hand ' + v.proof.hand + ' checked: the deal was fair' : 'Hand ' + v.proof.hand + ': a check FAILED';
+  const ul = document.createElement('ul');
+  for (const l of res.lines) { const li = document.createElement('li'); li.textContent = (l.ok === false ? 'Failed: ' : l.ok === null ? 'Skipped: ' : '') + l.text; if (l.ok === false) li.className = 'no'; ul.append(li); }
+  box.append(head, ul);
 }
 
 function seatEl(s, i, k, v) {

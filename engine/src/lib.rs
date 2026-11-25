@@ -8,10 +8,19 @@
 //! each browser only its own line.
 //!
 //! Host protocol: ptr = request(len); host writes the request at ptr; n = handle(len);
-//! ptr = response(). The program asks the host for randomness (env.ship_entropy, 64 bits,
-//! twice per hand) to shuffle the deck.
+//! ptr = response(). The program asks the host for randomness (env.ship_entropy, 64 bits a
+//! call, four calls per hand) for the secret half of each shuffle.
+//!
+//! The deck is sealed. Before a hand the table publishes a fingerprint (SHA-256) of a secret
+//! it has already chosen for that hand. Each player may then add a number of their own. The
+//! deck order is computed from the secret, the players' numbers and the hand number, by a
+//! public recipe (`shuffled_deck`). When the hand is over the secret is published, and anyone
+//! can check the fingerprint, redo the shuffle, and see that the cards dealt were those cards.
+//! So the table cannot pick or change the deck: it committed before the players' numbers
+//! existed, and the players cannot either, because they never see the secret in time.
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 
 pub const SEATS: usize = 8;
@@ -86,28 +95,60 @@ extern "C" { fn ship_entropy() -> i64; }
 fn host_entropy() -> u64 { unsafe { ship_entropy() as u64 } }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn host_entropy() -> u64 { 0x1234_5678_9abc_def0 }
+fn host_entropy() -> u64 {
+    // native builds are for tests: a counter run through a mixer
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mut z = N.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9); z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
 
-struct Rng([u64; 4]);
-impl Rng {
-    fn new(a: u64, b: u64, hand: u64) -> Rng {
-        let mut x = a ^ b.rotate_left(32) ^ hand.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let mut next = || { x = x.wrapping_add(0x9e37_79b9_7f4a_7c15); let mut z = x;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9); z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb); z ^ (z >> 31) };
-        Rng([next() ^ b, next(), next() ^ a, next()])
-    }
-    fn next(&mut self) -> u64 {
-        let s = &mut self.0;
-        let out = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
-        let t = s[1] << 17;
-        s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3]; s[2] ^= t; s[3] = s[3].rotate_left(45);
-        out
-    }
-    /// uniform in 0..n, no modulo bias
-    fn below(&mut self, n: u64) -> u64 {
+fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{:02x}", b)).collect() }
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return None; }
+    (0..text.len() / 2).map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()).collect()
+}
+
+/// a fresh 32-byte secret from the host
+fn new_secret() -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for k in 0..4 { out[8 * k..8 * k + 8].copy_from_slice(&host_entropy().to_le_bytes()); }
+    out
+}
+
+/// what the table publishes before a hand: it pins the secret down without giving it away
+pub fn commitment(secret: &[u8; 32]) -> String {
+    hex(&Sha256::new().chain_update(b"holdem-commit-v1").chain_update(secret).finalize())
+}
+
+/// The public recipe for the deck. Cards are dealt from the END of the result.
+///   key      = SHA-256("holdem-deck-v1" | secret | hand as 4 bytes LE | for each of the 8 seats: length byte, that player's number)
+///   stream   = SHA-256(key | 0 as 4 bytes LE), SHA-256(key | 1 ...), ... cut into 8-byte little-endian integers
+///   shuffle  = start from 0..52; for k = 51 down to 1: take integers x from the stream until
+///              x < limit, where limit = (2^64 - 1) - ((2^64 - 1) mod (k + 1)); swap positions k and x mod (k + 1)
+pub fn shuffled_deck(secret: &[u8; 32], hand: u32, seeds: &[Vec<u8>; SEATS]) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(b"holdem-deck-v1"); h.update(secret); h.update(hand.to_le_bytes());
+    for seed in seeds { h.update([seed.len() as u8]); h.update(seed); }
+    let key = h.finalize();
+    let (mut counter, mut ready): (u32, Vec<u64>) = (0, vec![]);
+    let mut next = || {
+        if ready.is_empty() {
+            let block = Sha256::new().chain_update(key).chain_update(counter.to_le_bytes()).finalize();
+            counter += 1;
+            for chunk in block.chunks(8).rev() { ready.push(u64::from_le_bytes(chunk.try_into().unwrap())); }
+        }
+        ready.pop().unwrap()
+    };
+    let mut deck: Vec<u8> = (0..52).collect();
+    for k in (1..52usize).rev() {
+        let n = k as u64 + 1;
         let limit = u64::MAX - (u64::MAX % n);
-        loop { let x = self.next(); if x < limit { return x % n; } }
+        let j = loop { let x = next(); if x < limit { break (x % n) as usize; } };
+        deck.swap(k, j);
     }
+    deck
 }
 
 // ---------------------------------------------------------------- splitting the money
@@ -175,6 +216,16 @@ pub struct Table {
     pub log: Vec<String>,
     pub results: Vec<Value>,
     pub cashed_out: u32, // chips taken away by players who left
+    // the sealed deck
+    secret: Option<[u8; 32]>,        // for the NEXT hand; only its fingerprint is public
+    next_commit: String,             // that fingerprint
+    cur_commit: String,              // and the one for the hand being played
+    seeds: [Vec<u8>; SEATS],         // players' numbers for the next hand
+    cur_secret: [u8; 32],            // the hand being played
+    cur_seeds: [Vec<u8>; SEATS],
+    cur_deck: Vec<u8>,
+    cur_dealt: Vec<usize>,
+    pub proof: Value,                // everything, published once the hand is over
 }
 
 #[derive(Deserialize)]
@@ -185,13 +236,15 @@ pub enum Req {
     Deal { token: String },
     Act { token: String, action: String, #[serde(default)] amount: Option<u32> },
     Rebuy { token: String },
+    Seed { token: String, seed: String },
     Hello,
 }
 
 impl Table {
     pub fn stage(&self) -> Stage { self.stage.unwrap_or(Stage::Idle) }
     fn say(&mut self, line: String) { self.log.push(line); if self.log.len() > 40 { self.log.remove(0); } }
-    fn remove(&mut self, i: usize) { if let Some(s) = self.seats[i].take() { self.cashed_out += s.chips; } }
+    fn seal_next(&mut self) { let s = new_secret(); self.next_commit = commitment(&s); self.secret = Some(s); }
+    fn remove(&mut self, i: usize) { if let Some(s) = self.seats[i].take() { self.cashed_out += s.chips; } self.seeds[i].clear(); }
     fn seat_of(&self, token: &str) -> Option<usize> {
         self.seats.iter().position(|s| s.as_ref().map(|s| s.token == token).unwrap_or(false))
     }
@@ -213,8 +266,15 @@ impl Table {
     }
 
     pub fn handle(&mut self, req: Req) -> Result<(), String> {
+        if self.secret.is_none() { self.seal_next(); }
         match req {
             Req::Hello => Ok(()),
+            Req::Seed { token, seed } => {
+                let i = self.seat_of(&token).ok_or("you are not seated")?;
+                let bytes = unhex(&seed).filter(|b| b.len() == 16).ok_or("a number is 32 hex digits")?;
+                self.seeds[i] = bytes;
+                Ok(())
+            }
             Req::Join { token, name } => {
                 if token.len() != 32 || token == SPECTATOR || !token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
                     return Err("bad token".into());
@@ -299,10 +359,14 @@ impl Table {
         let ready: Vec<usize> = (0..SEATS).filter(|i| self.seats[*i].as_ref().map(|s| s.chips > 0).unwrap_or(false)).collect();
         if ready.len() < 2 { return Err("need at least two players with chips".into()); }
         self.hand_no += 1;
-        let (a, b) = (host_entropy(), host_entropy());
-        let mut rng = Rng::new(a, b, self.hand_no as u64);
-        self.deck = (0..52).collect();
-        for k in (1..52usize).rev() { let j = rng.below(k as u64 + 1) as usize; self.deck.swap(k, j); }
+        // the secret was fixed, and its fingerprint shown, before the players sent their numbers
+        let secret = self.secret.take().unwrap();
+        let seeds = std::mem::take(&mut self.seeds);
+        self.deck = shuffled_deck(&secret, self.hand_no, &seeds);
+        self.cur_secret = secret; self.cur_seeds = seeds; self.cur_deck = self.deck.clone(); self.cur_dealt = ready.clone();
+        self.cur_commit = std::mem::take(&mut self.next_commit);
+        self.proof = Value::Null;
+        self.seal_next();                   // and seal the one after
         self.board.clear(); self.results.clear();
         for i in 0..SEATS {
             if let Some(s) = self.seats[i].as_mut() {
@@ -378,6 +442,12 @@ impl Table {
             if self.seats[i].as_ref().map(|s| s.leaving).unwrap_or(false) { self.remove(i); }
         }
         self.stage = Some(Stage::Idle); self.to_act = None; self.current_bet = 0;
+        // the hand is over: open the seal
+        self.proof = json!({
+            "hand": self.hand_no, "commit": self.cur_commit, "secret": hex(&self.cur_secret),
+            "seeds": self.cur_seeds.iter().map(|s| hex(s)).collect::<Vec<_>>(), "dealt": self.cur_dealt,
+            "deck": self.cur_deck.iter().map(|c| card_name(*c)).collect::<Vec<_>>(),
+        });
     }
 
     /// what one viewer may see; `viewer` is a seat number, or None for a spectator
@@ -414,6 +484,10 @@ impl Table {
             "seats": seats, "you": viewer, "actions": actions, "results": self.results,
             "log": &self.log[self.log.len().saturating_sub(14)..],
             "can_deal": idle && viewer.is_some() && ready >= 2, "blinds": [SMALL_BLIND, BIG_BLIND],
+            "sealed": if idle { Value::Null } else { json!(self.cur_commit) },
+            "next": {"hand": self.hand_no + 1, "commit": if self.secret.is_some() { json!(self.next_commit) } else { Value::Null },
+                     "seeded": self.seeds.iter().map(|s| !s.is_empty()).collect::<Vec<_>>()},
+            "proof": if idle { self.proof.clone() } else { Value::Null },
         })
     }
 
