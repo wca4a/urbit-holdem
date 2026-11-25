@@ -18,6 +18,7 @@ with its own entropy, and sends each browser only that player's two cards.
 | `ship/replay.hoon` | Generator that feeds a file of recorded requests to the engine on a ship, for testing. |
 | `test/mkpoker.mjs` | Bots play against the engine in Node and record every request they make. |
 | `test/node-ref.mjs` | Replays recorded requests in Node and fingerprints each reply, to compare with a ship. |
+| `test/poker-seat.py` | A seat for a player that is not a browser (a script, or an AI): join, act, and wait for your turn. It only asks the ship for its own token's view. |
 
 ## How it works
 
