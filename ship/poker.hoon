@@ -3,6 +3,7 @@
 ::    GET  /poker         the web page (bench/poker-ui.html)
 ::    POST /poker/api     one JSON request (join, deal, act, ...), JSON answer
 ::    POST /poker/poll    private view for the session (tab token in standalone)
+::    POST /poker/disconnect  short reconnect window for a closing guest tab
 ::    GET  /poker/auth/*  native OIDC sign-in and session lookup
 ::    POST /poker/auth/logout  end a game session
 ::    POST /poker/reset   standalone tables only
@@ -26,9 +27,8 @@
 +$  phase  $?(%ready [%keys eid=@ta code=@t] [%token eid=@ta jwks=@t])
 +$  flow  [expires=@da nonce=@t verifier=@t stage=phase]
 +$  session  [expires=@da who=@p]
-+$  state-2
-  $:  %2
-      sed=(unit seed)
++$  table-state
+  $:  sed=(unit seed)
       ver=@ud
       views=(map @t @t)
       closed=_|
@@ -37,7 +37,34 @@
       flows=(map @t flow)
       sessions=(map @t session)
   ==
++$  state-2  [%2 table-state]
++$  state-3  [%3 guests=(map @t @da) guest-wake=(unit @da) table-state]
 ++  spectator  '00000000000000000000000000000000'
+::  Round up to five seconds so rapid polling rarely changes saved state.
+++  idle-deadline
+  |=  now=@da
+  ^-  @da
+  (add ~m2 (mul ~s5 (div (add now (dec ~s5)) ~s5)))
+++  guest-alarm
+  |=  [task=?(%wait %rest) at=@da]
+  ^-  card
+  [%pass /guest-seats/[(scot %da at)] %arvo %b ?:(=(task %rest) [%rest at] [%wait at])]
+::  Track a seat when it first appears in the engine. After Leave, the engine
+::  can retain a folded seat until settlement. Never re-enroll that seat.
+++  track-seats
+  |=  [s=state-3 before=(map @t @t) now=@da]
+  ^-  state-3
+  =/  tracked=(map @t @da)
+    %-  malt
+    %+  murn  ~(tap by views.s)
+    |=  [token=@t *]
+    ^-  (unit [@t @da])
+    ?:  =(token spectator)  ~
+    =/  due  (~(get by guests.s) token)
+    ?^  due  `[token u.due]
+    ?:  (~(has by before) token)  ~
+    `[token (idle-deadline now)]
+  s(guests tracked)
 ++  new-seed
   |=  =bowl:gall
   ^-  seed
@@ -87,6 +114,31 @@
   ?>  ?=([%0 [[%octs *] ~]] yil)
   =/  o=octs  +.i.p.yil
   [o +.r]
+::
+::  Both browser actions and timed departures use the same Wasm state update.
+++  apply-move
+  |=  [s=state-3 body=octs b=bowl:gall]
+  ^-  [answer=@t next=state-3]
+  =/  out  (ask (need sed.s) body eny.b)
+  =/  lines=wain  (to-wain:format q.-.out)
+  ?~  lines  !!
+  =/  seen=(map @t @t)
+    %-  malt
+    %+  turn  t.lines
+    |=  line=@t
+    [(end [3 32] line) (rsh [3 32] line)]
+  =/  next  s(sed `+.out, ver +(ver.s), views seen)
+  [i.lines ?~(cfg.s (track-seats next views.s now.b) next)]
+::  Only successful requests ever reach this decoder.
+++  guest-command
+  |=  body=octs
+  ^-  (unit [op=@t token=@t])
+  =/  obj  (de:json:html q.body)
+  ?.  ?=([~ %o *] obj)  ~
+  =/  op  (~(get by p.u.obj) 'op')
+  =/  who  (~(get by p.u.obj) 'token')
+  ?.  &(?=([~ %s *] op) ?=([~ %s *] who))  ~
+  `[p.u.op p.u.who]
 ::
 ++  give
   |=  [eid=@ta status=@ud type=@t extra=header-list:http data=@t]
@@ -155,7 +207,7 @@
   :_  (auth-error eid.stage.f)
   [%pass /[-.stage.f]/[fid] %arvo %i %cancel-request ~]
 --
-=|  state-2
+=|  state-3
 =*  state  -
 ^-  agent:gall
 =<
@@ -171,20 +223,32 @@
 ++  on-load
   |=  old=vase
   ^-  (quip card _this)
-  ?:  ?=([%2 *] q.old)  [~ this(state !<(state-2 old))]
-  ?:  ?=([%1 *] q.old)
-    =/  was  !<(state-1 old)
-    ::  A formerly guarded dealer stays closed during the upgrade.
-    [~ this(sed sed.was, ver ver.was, views views.was, closed ?=(^ key-hash.was))]
-  =/  was  !<(state-0 old)
-  ?~  sed.was  [~ this(sed `(new-seed bowl))]
-  [~ this(sed sed.was, ver ver.was, views views.was)]
+  ?:  ?=([%3 *] q.old)  [~ this(state !<(state-3 old))]
+  =.  state
+    ?:  ?=([%2 *] q.old)
+      =/  was  !<(state-2 old)
+      [%3 ~ ~ +.was]
+    ?:  ?=([%1 *] q.old)
+      =/  was  !<(state-1 old)
+      ::  A formerly guarded dealer stays closed during the upgrade.
+      state(sed sed.was, ver ver.was, views views.was, closed ?=(^ key-hash.was))
+    =/  was  !<(state-0 old)
+    ?~  sed.was  state(sed `(new-seed bowl))
+    state(sed sed.was, ver ver.was, views views.was)
+  =.  state
+    ?:  |(closed ?=(^ cfg))  state
+    (track-seats state ~ now.bowl)
+  =^  timers  state  schedule-guests:work
+  [timers this]
 ++  on-poke
   |=  [=mark =vase]
   ^-  (quip card _this)
   ?.  ?=(?(%handle-http-request %noun) mark)  (on-poke:def mark vase)
+  =/  old-guests  guests
   =^  cards  state  (poke:work mark vase)
-  [cards this]
+  ?:  =(old-guests guests)  [cards this]
+  =^  timers  state  schedule-guests:work
+  [(join-cards cards timers) this]
 ++  on-watch
   |=  =path
   ^-  (quip card _this)
@@ -211,14 +275,14 @@
   ?:  =(%noun mark)
     ?>  =(src.bowl our.bowl)
     ?:  =(%reset q.vase)
-      [~ this(sed `(new-seed bowl), ver +(ver), views ~)]
+      [~ this(sed `(new-seed bowl), ver +(ver), views ~, guests ~)]
     =/  setup  ;;([%oidc c=config:oidc] q.vase)
     ?>  (valid-config:oidc c.setup)
     ::  An existing authenticated table can rotate its client credentials.
     =/  same=?  &(?=(^ cfg) =(issuer.u.cfg issuer.c.setup))
     ?.  |(same =(~ (~(del by views) spectator)))
       ~|  %finish-or-reset-table-before-changing-issuer  !!
-    =/  clean  this(cfg `c.setup, closed |, sessions ~, flows ~)
+    =/  clean  this(cfg `c.setup, closed |, sessions ~, flows ~, guests ~)
     =/  failed=(list card)
       %+  join-cards  (zing (turn ~(tap by flows) stop-flow))
       (turn ~(tap by sessions) rest-session)
@@ -253,9 +317,13 @@
     [(json-out eid 405 '{"error":"method not allowed"}') this]
   ?~  cfg
     ?:  =('/poker/poll' url)  (poll eid q.body ~)
+    ?:  =('/poker/disconnect' url)
+      =/  due  (~(get by guests) q.body)
+      :_  ?~(due this this(guests (~(put by guests) q.body (min u.due (add now.bowl ~s20)))))
+      (json-out eid 200 '{"ok":true}')
     ?:  =('/poker/api' url)   (play eid body)
     ?:  =('/poker/reset' url)
-      :_  this(sed `(new-seed bowl), ver +(ver), views ~)
+      :_  this(sed `(new-seed bowl), ver +(ver), views ~, guests ~)
       (json-out eid 200 '{"ok":true}')
     [(json-out eid 404 '{"error":"not found"}') this]
   ?.  (origin-ok:web header-list.request.req origin.u.cfg)
@@ -298,20 +366,49 @@
   =/  mine  (fall (~(get by views) token) (fall (~(get by views) spectator) 'null'))
   =/  extra  ?~(cfg '' (cat 3 ',"ship":' (ship-json who)))
   =/  out  (rap 3 ~['{"v":' (crip (a-co:co ver)) ',"view":' mine extra '}'])
+  =?  guests  (~(has by guests) token)
+    (~(put by guests) token (idle-deadline now.bowl))
   [(json-out eid 200 out) this]
 ++  play
   |=  [eid=@ta body=octs]
   ^-  (quip card _this)
-  =/  out  (ask (need sed) body eny.bowl)
-  =/  lines=wain  (to-wain:format q.-.out)
-  ?~  lines  !!
-  =/  seen=(map @t @t)
-    %-  malt
-    %+  turn  t.lines
-    |=  line=@t
-    [(end [3 32] line) (rsh [3 32] line)]
-  :_  this(sed `+.out, ver +(ver), views seen)
-  (json-out eid 200 i.lines)
+  =/  [answer=@t next=state-3]  (apply-move this body bowl)
+  :-  (json-out eid 200 answer)
+  ?:  |(?=(^ cfg) !=(answer '{"ok":true}'))  next
+  =/  cmd  (guest-command body)
+  ?~  cmd  next
+  ?.  (~(has by guests.next) token.u.cmd)  next
+  ?:  =('leave' op.u.cmd)  next(guests (~(del by guests.next) token.u.cmd))
+  next(guests (~(put by guests.next) token.u.cmd (idle-deadline now.bowl)))
+::  One Behn timer covers every guest. An existing earlier wake can safely
+::  recheck renewed leases and then schedule the new earliest deadline.
+++  schedule-guests
+  ^-  (quip card _this)
+  =/  soon=(unit @da)
+    %+  roll  ~(val by guests)
+    |=  [a=@da b=(unit @da)]
+    ^-  (unit @da)
+    `?~(b a (min a u.b))
+  ?:  =(soon guest-wake)  [~ this]
+  ?:  &(?=(^ soon) ?=(^ guest-wake) (lte u.guest-wake u.soon))  [~ this]
+  =/  cancel=(list card)  ?~(guest-wake ~ ~[(guest-alarm %rest u.guest-wake)])
+  :_  this(guest-wake soon)
+  ?~  soon  cancel
+  [(guest-alarm %wait u.soon) cancel]
+++  expire-guests
+  ^-  (quip card _this)
+  =.  guest-wake  ~
+  =/  tokens  ~(key by guests)
+  =/  left  ~(tap in tokens)
+  |-
+  ?~  left  schedule-guests
+  =/  due  (~(get by guests) i.left)
+  ?:  |(?=(~ due) (gth u.due now.bowl))  $(left t.left)
+  =/  token  i.left
+  =.  guests  (~(del by guests) token)
+  =/  body  (as-octs:mimes:html (rap 3 ~['{"op":"leave","token":"' token '"}']))
+  =/  result  (apply-move this body bowl)
+  $(left t.left, state next.result)
 ++  begin
   |=  [eid=@ta headers=header-list:http]
   ^-  (quip card _this)
@@ -405,6 +502,9 @@
     ?.  ?=([%iris %http-response *] sign-arvo)  `this
     (finished i.t.wire i.wire +>.sign-arvo)
   ?:  ?=([%behn %wake *] sign-arvo)
+    ?:  ?=([%guest-seats @ ~] wire)
+      ?.  &(?=(^ guest-wake) =((scot %da u.guest-wake) i.t.wire))  `this
+      expire-guests
     ?:  ?=([%session @ ~] wire)
       [~ this(sessions (~(del by sessions) i.t.wire))]
     ?:  ?=([%flow @ ~] wire)

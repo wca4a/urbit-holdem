@@ -156,6 +156,9 @@ fresh signed token fixtures. After `|commit %base`, run `+poker-web-check` and
 with two test identities, configure an empty disposable dealer using the
 command at the top of `test/native-login.mjs` and run `node test/native-login.mjs`.
 
+Run `node test/guest-presence.mjs <port>` against an empty local guest table
+to check reconnects, automatic folding and the two-minute timeout.
+
 To compare a ship against Node:
 
 ```sh
@@ -182,6 +185,15 @@ that URL with players. They can pick nicknames, sit down and play from their
 browsers. Each ship that installs the desk runs its own table, with its own
 seats, deck and game state. The release targets the Zuse Kelvin recorded
 in the distributor's `sys.kelvin` file and needs a runtime with urwasm.
+
+When the dealer receives a guest's tab-close notice, it gives them 20 seconds
+to reconnect.
+Refreshing or restoring a tab with the same guest token during that window
+keeps the seat and cards. If the browser stops polling without reporting a
+close, the dealer waits about two minutes after the last contact. Once the
+guest times out, the dealer folds their active hand. Chips already in the
+pot stay there. A seat is freed immediately between hands or when the
+current hand settles. The **Leave table** button skips the reconnect window.
 
 ## Build the publishing desk
 
@@ -212,7 +224,8 @@ and `test/poker-work.txt` to `<pier>/base/bench/poker-work.txt`.
 
 ## Known limits
 
-- No turn timer: if a player walks away mid-hand, the table waits for them.
+- A connected player can take as long as they like on their turn. Signed-in
+  ships keep their seats across disconnects.
 - Browsers poll about twice a second; there is no live push.
 - In standalone mode the page is served without login. Fine on a local test ship; think before
   putting it on a ship that matters.

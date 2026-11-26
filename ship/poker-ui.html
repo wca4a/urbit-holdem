@@ -127,6 +127,40 @@ function loadTabToken() {
     try { sessionStorage.setItem('poker-token', token); } catch (e) {}
   }
 }
+function watchGuestPresence() {
+  // Duplicating a tab can copy its sessionStorage and share the same seat.
+  const peers = new Set();
+  const id = hexOf(crypto.getRandomValues(new Uint8Array(8)));
+  let channel;
+  function resume() {
+    if (!channel && typeof BroadcastChannel !== 'undefined') {
+      try { channel = new BroadcastChannel('poker-presence-' + hexOf(sha256(asciiOf(token)))); }
+      catch { poll(); return; }
+      channel.onmessage = ({data: [event, peer]}) => {
+        if (event === 'bye') peers.delete(peer);
+        else if (event === 'hello' || event === 'here') {
+          peers.add(peer);
+          if (event === 'hello') channel?.postMessage(['here', id]);
+        }
+      };
+      channel.postMessage(['hello', id]);
+    }
+    poll();
+  }
+  window.addEventListener('pagehide', () => {
+    if (!peers.size) navigator.sendBeacon('/poker/disconnect', token);
+    channel?.postMessage(['bye', id]);
+    channel?.close();
+    channel = null;
+    peers.clear();
+  });
+  window.addEventListener('pageshow', resume);
+  window.addEventListener('online', poll);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') poll();
+  });
+  resume();
+}
 let version = -1, view = null, sending = false, lastMs = 0, raiseTo = null, raiseHand = -1;
 let mine = {};   // per hand number: what this browser saw for itself (fingerprint, its number, its cards, the board)
 
@@ -209,10 +243,10 @@ function setShip(next) {
   $('proof').replaceChildren();
   render();
 }
-async function post(path, body) {
+async function post(path, body, signal) {
   const revision = sessionRevision;
   const t = performance.now();
-  const r = await fetch(path, { method: 'POST', body });
+  const r = await fetch(path, { method: 'POST', body, signal });
   if (hostingLogin && r.status === 401 && revision === sessionRevision) setShip(null);
   if (!r.ok) throw new Error(hostingLogin && r.status === 401 ? 'Sign in with Tlon to play.' : 'The ship did not answer.');
   const j = await r.json(); lastMs = performance.now() - t;
@@ -235,7 +269,7 @@ async function poll() {
   polling = true;
   const revision = sessionRevision;
   try {
-    const p = await post('/poker/poll', hostingLogin ? '' : token);
+    const p = await post('/poker/poll', hostingLogin ? '' : token, AbortSignal.timeout(15000));
     if (revision !== sessionRevision) return;
     if (hostingLogin && 'ship' in p) setShip(p.ship);
     if (p.v !== version) { version = p.v; view = p.view; render(); }
@@ -355,6 +389,11 @@ function renderYou(v) {
   if (s.busted) { const b = document.createElement('button'); b.textContent = 'Buy back in'; b.onclick = () => send({ op: 'rebuy' }); row.append(b); }
   const l = document.createElement('button'); l.className = 'quiet'; l.textContent = 'Leave table'; l.onclick = () => send({ op: 'leave' }); row.append(l);
   box.append(p, row);
+  if (!hostingLogin) {
+    const hint = document.createElement('div'); hint.className = 'hint';
+    hint.textContent = 'Closing your last table tab gives you 20 seconds to restore it before the dealer folds your hand.';
+    box.append(hint);
+  }
 }
 
 function renderBar(v) {
@@ -395,6 +434,7 @@ async function start() {
     if (session.standalone === true) {
       hostingLogin = false;
       loadTabToken();
+      watchGuestPresence();
     } else if (session.ship === null || typeof session.ship === 'string') {
       setShip(session.ship);
     } else throw new Error();
@@ -416,7 +456,7 @@ async function start() {
     };
   }
   render();
-  poll(); setInterval(() => { if (!sending) poll(); }, 600);
+  poll(); setInterval(poll, 600);
 }
 start();
 </script>

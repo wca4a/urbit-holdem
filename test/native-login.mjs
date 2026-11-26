@@ -1,13 +1,13 @@
 // Run only against an empty disposable dealer on this machine (Node 22+).
 // In its Dojo:
 //   :poker &noun [%oidc 'http://localhost:34721' 'http://127.0.0.1:34725/v1/oidc' 'holdem' 'holdem-native-local-disposable-key']
-// Then run: node test/native-login.mjs
+// Then run: node test/native-login.mjs [dealer-port]
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { once } from 'node:events';
 
-const dealer = 'http://localhost:34721';
+const dealer = 'http://localhost:' + (process.argv[2] || '34721');
 const issuer = 'http://127.0.0.1:34725/v1/oidc';
 const client = 'holdem';
 const secret = 'holdem-native-local-disposable-key';
@@ -124,6 +124,8 @@ try {
   await move(players[0], { op: 'deal' });
   const [a, b, spectator] = await Promise.all([...players, ''].map(poll));
   assert.deepEqual([a.view.you, b.view.you, spectator.view.you], [0, 1, null]);
+  assert.equal((await request('/poker/disconnect', players[0], 'POST', '')).status, 404,
+    'the guest departure endpoint is disabled at signed-in tables');
   assert.deepEqual(a.view.seats.slice(0, 2).map(s => s.name), ['~zod', '~sampel-palnet']);
   for (const player of [a, b]) {
     const i = player.view.you, cards = player.view.seats[i].cards;
