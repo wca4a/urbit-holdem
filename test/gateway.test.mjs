@@ -1,21 +1,63 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { once } from 'node:events';
+import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import test from 'node:test';
-import { createBridge } from '../login/bridge.mjs';
 import { createGateway } from '../login/gateway.mjs';
 
 const gameOrigin = 'https://game.example';
-const bridgeOrigin = 'https://identity.example';
+const issuer = 'https://identity.example/v1/oidc';
 const dealerOrigin = 'https://dealer.example';
-const bridgeSecret = 'b'.repeat(32);
+const clientId = 'holdem';
+const clientSecret = 'b'.repeat(32);
 const dealerKey = 'd'.repeat(32);
 const seatSecret = 's'.repeat(32);
 const spectator = '0'.repeat(32);
-const accounts = {
-  '~zod': 'use-00000000-0000-0000-0000-000000000001',
-  '~divmes-davset-samhec-fasnem': 'use-00000000-0000-0000-0000-000000000002',
-};
+
+// The issuer fixture implements discovery, one-time codes with S256, JWKS and signed ID tokens.
+function testIssuer() {
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const jwk = { ...publicKey.export({ format: 'jwk' }), alg: 'RS256', kid: 'test-key', use: 'sig' };
+  const codes = new Map();
+  const encode = obj => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const authorize = (target, ship, overrides, invalidSignature) => {
+    const p = target.searchParams;
+    assert.equal(target.origin + target.pathname, issuer + '/authorize');
+    assert.equal(p.get('scope'), 'openid ship');
+    assert.equal(p.get('response_type'), 'code');
+    assert.equal(p.get('client_id'), clientId);
+    assert.equal(p.get('redirect_uri'), gameOrigin + '/poker/auth/callback');
+    assert.equal(p.get('code_challenge_method'), 'S256');
+    assert.ok(p.get('nonce'));
+    const code = randomUUID();
+    codes.set(code, { ship, nonce: p.get('nonce'), challenge: p.get('code_challenge'), overrides, invalidSignature });
+    return '/poker/auth/callback?' + new URLSearchParams({ state: p.get('state'), code, iss: issuer });
+  };
+  const serve = (url, options) => {
+    if (url === issuer + '/.well-known/openid-configuration') return Response.json({
+      issuer, authorization_endpoint: issuer + '/authorize', token_endpoint: issuer + '/token',
+      jwks_uri: issuer + '/keys', response_types_supported: ['code'], subject_types_supported: ['public'],
+      id_token_signing_alg_values_supported: ['RS256'], authorization_response_iss_parameter_supported: true,
+    });
+    if (url === issuer + '/keys') return Response.json({ keys: [jwk] });
+    assert.equal(url, issuer + '/token');
+    assert.equal(new Headers(options.headers).get('authorization'), 'Basic ' + Buffer.from(clientId + ':' + clientSecret).toString('base64'));
+    const p = new URLSearchParams(options.body);
+    assert.equal(p.get('grant_type'), 'authorization_code');
+    assert.equal(p.get('redirect_uri'), gameOrigin + '/poker/auth/callback');
+    const grant = codes.get(p.get('code'));
+    assert.ok(grant);
+    codes.delete(p.get('code'));
+    assert.equal(createHash('sha256').update(p.get('code_verifier')).digest('base64url'), grant.challenge);
+    const iat = Math.floor(Date.now() / 1000);
+    const claims = { iss: issuer, aud: clientId, sub: 'player-' + grant.ship, iat, exp: iat + 300,
+      nonce: grant.nonce, ship: grant.ship, ...grant.overrides };
+    const payload = encode({ alg: 'RS256', kid: jwk.kid }) + '.' + encode(claims);
+    const signature = sign('RSA-SHA256', Buffer.from(grant.invalidSignature ? 'invalid test signature' : payload), privateKey);
+    return Response.json({ token_type: 'Bearer', access_token: 'test-access-token', id_token: payload + '.' + signature.toString('base64url') });
+  };
+  return { authorize, serve };
+}
 
 async function listen(t, server) {
   server.listen(0, '127.0.0.1');
@@ -55,20 +97,9 @@ async function makeDealer() {
 test('two Tlon sessions play a hand on the Wasm dealer and reconnect to their own seats', async t => {
   const deal = await makeDealer();
   let time = Date.now(), protectedDealer = true;
-  const issuer = await listen(t, createBridge({
-    gameOrigin, bridgeOrigin, secret: bridgeSecret, now: () => time,
-    fetchImpl: async (input, options) => {
-      const cookie = new Headers(options.headers).get('cookie');
-      const ship = Object.keys(accounts).find(s => cookie === 'SolarisSession=test-' + s);
-      if (!ship) return Response.json({}, { status: 401 });
-      const profile = bridgeOrigin + '/v1/users/' + accounts[ship];
-      if (input === profile + '/pending-lures') return Response.json([]);
-      assert.equal(input, profile);
-      return Response.json({ id: accounts[ship], ships: [ship.slice(1)] });
-    },
-  }));
+  const idp = testIssuer();
   const base = await listen(t, createGateway({
-    gameOrigin, bridgeOrigin, dealerOrigin, bridgeSecret, seatSecret, dealerKey, now: () => time,
+    gameOrigin, oidcIssuer: issuer, clientId, clientSecret, dealerOrigin, seatSecret, dealerKey, now: () => time,
     fetchImpl: async (input, options) => {
       const url = new URL(input), headers = new Headers(options.headers);
       if (url.origin === dealerOrigin) {
@@ -77,9 +108,7 @@ test('two Tlon sessions play a hand on the Wasm dealer and reconnect to their ow
           headers: protectedDealer ? { 'X-Poker-Protected': '1' } : {},
         });
       }
-      assert.equal(url.href, bridgeOrigin + '/holdem-auth/redeem');
-      assert.equal(headers.get('authorization'), 'Bearer ' + bridgeSecret);
-      return fetch(issuer + url.pathname, options);
+      return idp.serve(url.href, options);
     },
   }));
   function get(path, cookie = '') {
@@ -88,21 +117,15 @@ test('two Tlon sessions play a hand on the Wasm dealer and reconnect to their ow
   function post(path, cookie, body = '', origin = gameOrigin) {
     return fetch(base + path, { method: 'POST', headers: { cookie, origin }, body });
   }
-  async function login(ship) {
+  async function grant(ship, overrides, invalidSignature) {
     const start = await get('/poker/auth/start');
     assert.equal(start.status, 303);
     const target = new URL(start.headers.get('location'));
-    assert.equal(target.origin + target.pathname, bridgeOrigin + '/holdem-auth/authorize');
-    const state = target.searchParams.get('state');
     const stateCookie = start.headers.getSetCookie()[0].split(';')[0];
-    const consent = await fetch(issuer + '/v1/holdem-auth/consent', {
-      method: 'POST', redirect: 'manual', headers: { origin: bridgeOrigin, cookie: 'SolarisSession=test-' + ship },
-      body: new URLSearchParams({ user: accounts[ship], state, ship }),
-    });
-    assert.equal(consent.status, 303);
-    const targetGame = new URL(consent.headers.get('location'));
-    assert.equal(targetGame.origin, gameOrigin);
-    const callback = targetGame.pathname + targetGame.search;
+    return { callback: idp.authorize(target, ship, overrides, invalidSignature), stateCookie };
+  }
+  async function login(ship) {
+    const { callback, stateCookie } = await grant(ship);
     assert.equal((await get(callback)).status, 400, 'requires the initiating browser cookie');
     const success = await get(callback, stateCookie);
     assert.equal(success.status, 303);
@@ -125,9 +148,18 @@ test('two Tlon sessions play a hand on the Wasm dealer and reconnect to their ow
   }
   assert.match(await (await get('/poker')).text(), /const hostingLogin = true;/);
   assert.equal((await post('/poker/api', '', '{"op":"join"}')).status, 401);
+  for (const [reason, overrides] of Object.entries({
+    audience: { aud: 'another-app' }, issuer: { iss: 'https://another.example' },
+    nonce: { nonce: 'wrong-nonce' }, expiration: { exp: 1000 }, signature: {},
+  })) {
+    const { callback, stateCookie } = await grant('~zod', overrides, reason === 'signature');
+    const denied = await get(callback, stateCookie);
+    assert.equal(denied.status, 400, 'invalid ' + reason);
+    assert.ok(!denied.headers.getSetCookie().some(c => c.startsWith('__Host-holdem-session=')));
+  }
   const a = await login('~zod'), b = await login('~divmes-davset-samhec-fasnem');
   const join = { op: 'join', token: spectator, name: 'wrong-name', ship: '~mar' };
-  assert.equal((await post('/poker/api', a, JSON.stringify(join), bridgeOrigin)).status, 403);
+  assert.equal((await post('/poker/api', a, JSON.stringify(join), 'https://elsewhere.example')).status, 403);
   await move(a, join); await move(b, join);
   await move(a, { op: 'seed', seed: '12'.repeat(16) });
   await move(b, { op: 'seed', seed: '34'.repeat(16) });

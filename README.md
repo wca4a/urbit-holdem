@@ -53,53 +53,45 @@ the player completes the usual OTP and MFA flow in another tab, returns to the
 consent screen, chooses a ship, and comes back to the table. Signing in again as
 the same ship recovers its seat and chips while the dealer keeps that seat.
 
-This integration includes a small service that **Tlon must mount on its hosting
-origin**. A standalone deployment of the poker website cannot use Tlon's existing
-login page as an identity callback. The game receives a one-time code and a ship
-name. The OTP, hosting cookie, account profile and ship access code stay outside
-the game. The poker seat token stays between the website gateway and the dealer.
+The gateway is an OpenID Connect client. It opens the Tlon Hosting issuer,
+requests the `openid ship` scopes and exchanges the authorization code using
+PKCE. It validates the signed ID token, including its issuer, audience, expiry
+and nonce, and binds the `ship` claim to the seat. Tlon keeps the OTP, account
+and hosting cookie. The game never retrieves the ship access code.
 
 ### Run the hosted table
 
-Use Node 22 or newer. Both services use Node built-ins. Configure three
-independent secrets (for example, generate each with `openssl rand -hex 32`)
-in the service environment.
+Use Node 22 or newer. Install the client library with `npm ci`. Configure the
+following environment variables on the gateway.
 
-| Setting | Where | Value |
-| --- | --- | --- |
-| `GAME_ORIGIN` | Both services | Public HTTPS origin of the poker website, on a separate hostname from Tlon Hosting |
-| `BRIDGE_ORIGIN` | Both services | Horizon's HTTPS origin, where the player ordinarily signs in |
-| `BRIDGE_SECRET` | Both services | Shared secret for redeeming one-time codes |
-| `SOLARIS_ORIGIN` | Bridge | Optional trusted Solaris API origin, defaults to `BRIDGE_ORIGIN` |
-| `DEALER_ORIGIN` | Gateway | Dedicated ship origin (HTTPS, or HTTP on loopback) |
-| `DEALER_KEY` | Gateway | Random secret whose SHA-256 digest is configured on the ship |
-| `SEAT_SECRET` | Gateway | Stable secret used to derive a separate private seat token for each ship |
+| Setting | Value |
+| --- | --- |
+| `GAME_ORIGIN` | Public HTTPS origin of the poker website on a separate hostname from Hosting |
+| `OIDC_ISSUER` | Exact issuer URL. The proposed Tlon staging issuer is `https://test.tlon.systems/v1/oidc` |
+| `OIDC_CLIENT_ID` | Client ID registered by the hosting operator for this game |
+| `OIDC_CLIENT_SECRET` | Registered client secret for `client_secret_basic` authentication |
+| `DEALER_ORIGIN` | Dedicated ship origin (HTTPS, or HTTP on loopback) |
+| `DEALER_KEY` | Independent random secret whose SHA-256 digest is configured on the ship |
+| `SEAT_SECRET` | Independent stable random secret used to derive private seat tokens |
 
-1. Install the agent, engine and page as described in **Run it on a ship**. Start
-   with an empty table. At the local Dojo, configure the dealer with
-   `:poker &noun [%gateway-key (shax 'YOUR-DEALER-KEY')]`. Use a hex key as above.
-   This locks the dealer's page, API, polling and reset routes to the gateway.
-2. On the Tlon side run `node login/bridge.mjs` behind the **same browser origin
-   as Horizon**. Route `/holdem-auth/authorize`, `/holdem-auth/redeem`,
-   `/v1/holdem-auth/ships` and `/v1/holdem-auth/consent` to its loopback
-   listener (`BRIDGE_PORT`, default 7881). Preserve the existing Horizon
-   `/login` and Solaris `/v1` routes. The two form routes live under `/v1` to
-   receive the hosting cookie. The bridge checks the current-user/MFA guard on
-   `/v1/users/<id>/pending-lures` with HEAD, then reads the owned ship list
-   from the account. It repeats those checks when the player confirms.
-3. Run `node login/gateway.mjs` behind the game website's HTTPS proxy and route
-   the game origin to its loopback listener (`PORT`, default 3000). Open
-   `/poker`. The gateway requires the protected-dealer response before opening
-   play. It exposes no table reset operation.
-4. Use one instance of each Node service. Login state, one-minute exchange codes
-   and twelve-hour website sessions live in memory. After a restart, signing
-   in again recovers a seat if the gateway kept its `SEAT_SECRET`. Keep login
-   query strings and authentication headers out of reverse-proxy logs.
+1. Install the agent, engine and page as described in **Run it on a ship**.
+   Start with an empty table, generate the dealer and seat secrets independently
+   (for example with `openssl rand -hex 32`), and configure the dealer at its
+   local Dojo with `:poker &noun [%gateway-key (shax 'YOUR-DEALER-KEY')]`.
+2. Have the hosting operator register the exact callback
+   `${GAME_ORIGIN}/poker/auth/callback`. The issuer must support the code flow
+   with PKCE S256, publish discovery and signing keys, and include the selected
+   `~ship` in the RS256-signed ID token after user consent.
+3. Run `node login/gateway.mjs` and route your website's HTTPS traffic to its
+   loopback listener (`PORT`, default 3000). Open `/poker`.
+4. Use one gateway instance. Pending logins and twelve-hour game sessions live
+   in memory. After a restart, signing in again recovers a seat if the gateway
+   kept its `SEAT_SECRET`. Exclude authentication headers and callback query
+   strings from reverse-proxy logs.
 
-Test the gateway and identity exchange locally with
-`node --test test/bridge.test.mjs test/gateway.test.mjs`. The tests run the
-real services and Wasm engine with simulated Solaris responses. A live OTP
-smoke test requires the hosting-side routes and a test hosting account.
+Run `npm test` to exercise the client, signed token validation and Wasm game
+with test identities. A live Hosting OTP test requires an enabled issuer, a
+registered client, and a staging Hosting account with an owned ship.
 
 ## The sealed deck
 

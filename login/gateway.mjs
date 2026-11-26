@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import { createHmac, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import * as oidc from 'openid-client';
 
 const spectator = '0'.repeat(32);
 const nonce = () => randomBytes(32).toString('base64url');
@@ -36,21 +37,36 @@ async function readAction(req) {
   return action;
 }
 
-export function createGateway({ gameOrigin, bridgeOrigin, dealerOrigin, bridgeSecret, seatSecret, dealerKey, fetchImpl = fetch, now = Date.now }) {
+export function createGateway({ gameOrigin, oidcIssuer, clientId, clientSecret, dealerOrigin, seatSecret, dealerKey, fetchImpl = fetch, now = Date.now }) {
   checkedOrigin(gameOrigin, 'GAME_ORIGIN');
-  checkedOrigin(bridgeOrigin, 'BRIDGE_ORIGIN');
   checkedOrigin(dealerOrigin, 'DEALER_ORIGIN');
-  const secrets = [bridgeSecret, seatSecret, dealerKey];
-  if (gameOrigin === dealerOrigin || bridgeOrigin === dealerOrigin ||
-      new URL(gameOrigin).hostname === new URL(bridgeOrigin).hostname ||
-      secrets.some(s => !s || s.length < 32) || new Set(secrets).size !== 3) {
-    throw new Error('Use separate game and hosting hostnames, a dedicated dealer origin, and three independent secrets of at least 32 characters');
+  const issuer = new URL(oidcIssuer);
+  checkedOrigin(issuer.origin, 'OIDC_ISSUER');
+  if (issuer.username || issuer.password || issuer.search || issuer.hash || issuer.pathname.includes('/.well-known/')) {
+    throw new Error('OIDC_ISSUER must be the issuer identifier from the provider');
+  }
+  if (gameOrigin === dealerOrigin || issuer.origin === dealerOrigin || new URL(gameOrigin).hostname === issuer.hostname ||
+      !clientId || !clientSecret || [seatSecret, dealerKey].some(s => !s || s.length < 32) ||
+      new Set([seatSecret, dealerKey, clientSecret]).size !== 3) {
+    throw new Error('Configure separate game, dealer and hosting endpoints, OIDC client credentials, and independent seat and dealer keys of at least 32 characters');
   }
   const secure = gameOrigin.startsWith('https:');
   const prefix = secure ? '__Host-holdem-' : 'holdem-';
   const marker = 'const hostingLogin = false;';
   if (!defaultPage.includes(marker)) throw new Error('Missing hosting login switch in table page');
   const page = defaultPage.replace(marker, 'const hostingLogin = true;');
+  const redirectUri = gameOrigin + '/poker/auth/callback';
+  let configuration;
+  function discover() {
+    // The code flow normally trusts TLS at the token endpoint. Require JWKS
+    // signature verification as well before accepting the identity claim.
+    const execute = [oidc.enableNonRepudiationChecks];
+    if (issuer.protocol === 'http:') execute.push(oidc.allowInsecureRequests);
+    configuration ??= oidc.discovery(issuer, clientId, { id_token_signed_response_alg: 'RS256' },
+      oidc.ClientSecretBasic(clientSecret), { execute, timeout: 8, [oidc.customFetch]: fetchImpl })
+      .catch(error => { configuration = undefined; throw error; });
+    return configuration;
+  }
 
   const sessions = new Map();
   const activeFlows = new Map();
@@ -70,10 +86,10 @@ export function createGateway({ gameOrigin, bridgeOrigin, dealerOrigin, bridgeSe
   function cookie(name, value, seconds) {
     return prefix + name + '=' + value + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=' + seconds + (secure ? '; Secure' : '');
   }
-  async function upstream(url, options, protectedDealer = false) {
+  async function upstream(url, options) {
     const r = await fetchImpl(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(8000) });
     if (!r.ok) throw bad(502, 'upstream service unavailable');
-    if (protectedDealer && r.headers.get('X-Poker-Protected') !== '1') throw bad(503, 'dealer login protection is unavailable');
+    if (r.headers.get('X-Poker-Protected') !== '1') throw bad(503, 'dealer login protection is unavailable');
     return r.json();
   }
 
@@ -81,11 +97,11 @@ export function createGateway({ gameOrigin, bridgeOrigin, dealerOrigin, bridgeSe
   let dealerCheck;
   async function callDealer(path, body) {
     // Probe before the first move. Older agents accept arbitrary POST paths.
-    dealerCheck ??= upstream(dealerOrigin + '/poker/gateway-status', { headers: dealerHeaders }, true)
+    dealerCheck ??= upstream(dealerOrigin + '/poker/gateway-status', { headers: dealerHeaders })
       .then(status => { if (status.protected !== true) throw bad(503, 'dealer login protection is unavailable'); });
     try {
       await dealerCheck;
-      return await upstream(dealerOrigin + path, { method: 'POST', headers: dealerHeaders, body }, true);
+      return await upstream(dealerOrigin + path, { method: 'POST', headers: dealerHeaders, body });
     } catch (error) {
       dealerCheck = null;
       throw error;
@@ -120,25 +136,40 @@ export function createGateway({ gameOrigin, bridgeOrigin, dealerOrigin, bridgeSe
         }
         if (path === '/poker/auth/session') return json(200, { ship });
         if (path === '/poker/auth/start') {
-          const state = nonce();
+          const config = await discover();
+          const state = oidc.randomState(), expectedNonce = oidc.randomNonce();
+          const verifier = oidc.randomPKCECodeVerifier();
+          const target = oidc.buildAuthorizationUrl(config, {
+            response_type: 'code', redirect_uri: redirectUri, scope: 'openid ship',
+            state, nonce: expectedNonce, code_challenge_method: 'S256',
+            code_challenge: await oidc.calculatePKCECodeChallenge(verifier),
+          });
           const ttl = 600;
           activeFlows.delete(get('state'));
-          store(activeFlows, state, {}, ttl);
+          store(activeFlows, state, { expectedNonce, verifier }, ttl);
           res.setHeader('Set-Cookie', cookie('state', state, ttl));
-          return redirect(bridgeOrigin + '/holdem-auth/authorize?state=' + state);
+          return redirect(target.href);
         }
         if (path === '/poker/auth/callback') {
           const state = url.searchParams.get('state');
-          const code = url.searchParams.get('code');
-          if (!state || state !== get('state') || !lookup(activeFlows, state) || !code || code.length > 256) {
+          const flow = lookup(activeFlows, state);
+          if (!state || state !== get('state') || !flow) {
             throw bad(400, 'login expired or invalid. Return to /poker to sign in again');
           }
           activeFlows.delete(state);
           res.setHeader('Set-Cookie', cookie('state', '', 0));
-          const identity = await upstream(bridgeOrigin + '/holdem-auth/redeem', {
-            method: 'POST', headers: { Authorization: 'Bearer ' + bridgeSecret, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ state, code }),
-          });
+          const callback = new URL(redirectUri);
+          callback.search = url.search;
+          const config = await discover();
+          let identity;
+          try {
+            const tokens = await oidc.authorizationCodeGrant(config, callback, {
+              expectedState: state, expectedNonce: flow.expectedNonce, pkceCodeVerifier: flow.verifier,
+            });
+            identity = tokens.claims();
+          } catch {
+            throw bad(400, 'invalid authorization response');
+          }
           if (typeof identity?.ship !== 'string' || identity.ship.length > 128 || !/^~(?:[a-z]{3}|[a-z]{6})(?:-{1,2}[a-z]{6})*$/.test(identity.ship)) {
             throw bad(502, 'identity service returned an invalid ship');
           }
@@ -183,8 +214,8 @@ export function createGateway({ gameOrigin, bridgeOrigin, dealerOrigin, bridgeSe
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const { GAME_ORIGIN: gameOrigin, BRIDGE_ORIGIN: bridgeOrigin, DEALER_ORIGIN: dealerOrigin,
-    BRIDGE_SECRET: bridgeSecret, SEAT_SECRET: seatSecret, DEALER_KEY: dealerKey, PORT: port = 3000 } = process.env;
-  createGateway({ gameOrigin, bridgeOrigin, dealerOrigin, bridgeSecret, seatSecret, dealerKey })
+  const { GAME_ORIGIN: gameOrigin, OIDC_ISSUER: oidcIssuer, OIDC_CLIENT_ID: clientId, OIDC_CLIENT_SECRET: clientSecret,
+    DEALER_ORIGIN: dealerOrigin, SEAT_SECRET: seatSecret, DEALER_KEY: dealerKey, PORT: port = 3000 } = process.env;
+  createGateway({ gameOrigin, oidcIssuer, clientId, clientSecret, dealerOrigin, seatSecret, dealerKey })
     .listen(Number(port), '127.0.0.1', () => console.log('Hold’em gateway listening on loopback port ' + port));
 }
