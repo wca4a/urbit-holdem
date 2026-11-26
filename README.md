@@ -16,6 +16,8 @@ the ship did not pick or change the cards.
 | `engine/` | The game: rules, hand ranking, pots, per-player views. Rust, depends only on serde and serde_json. |
 | `poker.wasm` | A prebuilt copy of the engine (about 300 KB). |
 | `ship/poker.hoon` | Gall agent: serves the page, runs the engine in urwasm, keeps each player's view. |
+| `ship/poker-oidc.hoon` | Builds the hosting authorization and token requests and verifies the signed ship identity. |
+| `ship/poker-web.hoon` | Reads the dealer session cookie and binds moves and private views to the player's seat. |
 | `ship/poker-ui.html` | The table page. One plain HTML file, no build step. |
 | `ship/replay.hoon` | Generator that feeds a file of recorded requests to the engine on a ship, for testing. |
 | `test/mkpoker.mjs` | Bots play against the engine in Node and record every request they make. |
@@ -37,61 +39,59 @@ Every reply is a few lines of text:
 2. one line per seated player: their 32-character secret token, then the table as that player may see it
 3. one line for spectators
 
-The agent keeps lines 2 and 3 in a map keyed by token. A browser polls with its
-token and gets its own line. Polling does not run Wasm, so idle players cost
+The agent keeps lines 2 and 3 in a map keyed by token. At a signed-in table
+the dealer picks the token from the player's session and returns that player's
+view. Standalone guest tabs supply their own tokens. Polling does not run Wasm, so idle players cost
 nothing in the engine.
 
 Rules covered: up to 8 seats, blinds of 5 and 10, 1,000 starting chips, minimum
 raises, all-ins, side pots, split pots with odd chips, joining and leaving
 mid-hand, buying back in.
 
-## Play on a website with a Tlon ship
+## Sign in to a dealer ship with Tlon
 
-The optional website gateway lets spectators watch and Tlon Hosting users sit as
-a ship they own. **Sign in with Tlon to play** opens the hosting site. If needed,
-the player completes the usual OTP and MFA flow in another tab, returns to the
-consent screen, chooses a ship, and comes back to the table. Signing in again as
-the same ship recovers its seat and chips while the dealer keeps that seat.
+Open `https://<dealer-host>/poker`. The dealer ship's Eyre endpoint serves the
+page, receives game actions and returns each player's view. **Sign in with
+Tlon to play** opens the hosting site. Complete the usual hosting login if
+needed, select an owned ship, and approve the return to this dealer. The
+dealer handles `/poker/auth/callback`, exchanges the code through Iris, and
+checks the signed ID token before creating a table session. The hosting OTP
+and ship access code stay at Hosting. Spectators can watch without a login.
 
-The gateway is an OpenID Connect client. It opens the Tlon Hosting issuer,
-requests the `openid ship` scopes and exchanges the authorization code using
-PKCE. It validates the signed ID token, including its issuer, audience, expiry
-and nonce, and binds the `ship` claim to the seat. Tlon keeps the OTP, account
-and hosting cookie. The game never retrieves the ship access code.
+### Set up one staging table
 
-### Run the hosted table
+1. Install the files under **Run it on a ship**. Choose a dedicated dealer
+   with a stable, publicly accessible HTTPS origin. The player can use any
+   ship listed on their staging Hosting account.
+2. Have the staging Hosting operator enable the issuer at
+   `https://test.tlon.systems/v1/oidc` and register a confidential client
+   for this dealer. Register **exactly**
+   `https://<dealer-host>/poker/auth/callback`. Use authorization code flow,
+   PKCE S256, the `openid ship` scopes and `client_secret_basic`. Give the
+   dealer operator the registered client ID and secret privately.
+3. With an empty table, enable sign-in in the dealer's local Dojo. Substitute
+   the real values in this command. Use origins without a trailing slash.
 
-Use Node 22 or newer. Install the client library with `npm ci`. Configure the
-following environment variables on the gateway.
+   ```hoon
+   :poker &noun [%oidc 'https://<dealer-host>' 'https://test.tlon.systems/v1/oidc' '<client-id>' '<client-secret>']
+   ```
 
-| Setting | Value |
-| --- | --- |
-| `GAME_ORIGIN` | Public HTTPS origin of the poker website on a separate hostname from Hosting |
-| `OIDC_ISSUER` | Exact issuer URL. The proposed Tlon staging issuer is `https://test.tlon.systems/v1/oidc` |
-| `OIDC_CLIENT_ID` | Client ID registered by the hosting operator for this game |
-| `OIDC_CLIENT_SECRET` | Registered client secret for `client_secret_basic` authentication |
-| `DEALER_ORIGIN` | Dedicated ship origin (HTTPS, or HTTP on loopback) |
-| `DEALER_KEY` | Independent random secret whose SHA-256 digest is configured on the ship |
-| `SEAT_SECRET` | Independent stable random secret used to derive private seat tokens |
+4. Open the dealer's `/poker` in a signed-out browser and check that it opens
+   as a spectator. Choose **Sign in with Tlon to play** and select your
+   staging ship at Hosting. Check that the browser returns to the dealer's origin,
+   the seat shows the selected ship, and signing out and back in restores
+   that ship's seat. A second player should see only their own hole cards.
 
-1. Install the agent, engine and page as described in **Run it on a ship**.
-   Start with an empty table, generate the dealer and seat secrets independently
-   (for example with `openssl rand -hex 32`), and configure the dealer at its
-   local Dojo with `:poker &noun [%gateway-key (shax 'YOUR-DEALER-KEY')]`.
-2. Have the hosting operator register the exact callback
-   `${GAME_ORIGIN}/poker/auth/callback`. The issuer must support the code flow
-   with PKCE S256, publish discovery and signing keys, and include the selected
-   `~ship` in the RS256-signed ID token after user consent.
-3. Run `node login/gateway.mjs` and route your website's HTTPS traffic to its
-   loopback listener (`PORT`, default 3000). Open `/poker`.
-4. Use one gateway instance. Pending logins and twelve-hour game sessions live
-   in memory. After a restart, signing in again recovers a seat if the gateway
-   kept its `SEAT_SECRET`. Exclude authentication headers and callback query
-   strings from reverse-proxy logs.
+The dealer talks to the Tlon issuer's fixed `/auth`, `/token` and `/jwks`
+paths. The token exchange and signature checks run on the dealer. Each dealer
+has its own client registration and table sessions. Keep the registered
+secret, Dojo history and pier private. Exclude callback query strings from
+HTTP access logs.
 
-Run `npm test` to exercise the client, signed token validation and Wasm game
-with test identities. A live Hosting OTP test requires an enabled issuer, a
-registered client, and a staging Hosting account with an owned ship.
+An upgrade preserves an existing game. If the previous version required a
+gateway key, the upgraded table stays closed until the operator configures
+OIDC. To retire an old table and clear its hands and seats deliberately, run
+`:poker &noun %reset` in the dealer's Dojo before configuring the issuer.
 
 ## The sealed deck
 
@@ -148,6 +148,14 @@ cd test
 node verify.mjs 300      # the page's checker against 300 bot hands, then against six kinds of tampering
 ```
 
+To check the native login helpers on a mounted disposable ship, copy
+`test/poker-web-check.hoon` to `<pier>/base/gen/poker-web-check.hoon`. Run
+`node test/oidc-verifier.mjs > <pier>/base/gen/test-poker-oidc.hoon` to generate
+fresh signed token fixtures. After `|commit %base`, run `+poker-web-check` and
+`+test-poker-oidc` in Dojo. To exercise the full HTTP callback and play a hand
+with two test identities, configure an empty disposable dealer using the
+command at the top of `test/native-login.mjs` and run `node test/native-login.mjs`.
+
 To compare a ship against Node:
 
 ```sh
@@ -165,13 +173,16 @@ entropy import with the same fixed value Node uses.
 With the `%base` desk mounted:
 
 ```
+ship/poker-web.hoon  ->  <pier>/base/lib/poker-web.hoon
+ship/poker-oidc.hoon ->  <pier>/base/lib/poker-oidc.hoon
 ship/poker.hoon      ->  <pier>/base/app/poker.hoon
 poker.wasm           ->  <pier>/base/bench/poker.wasm
 ship/poker-ui.html   ->  <pier>/base/bench/poker-ui.html
 ```
 
 Then `|commit %base` and `|start %poker`, and open `http://<ship>/poker`. Each
-browser tab is one player (the token lives in the tab's session storage).
+browser tab is one player in standalone mode. Once configured for OIDC, each
+verified ship has its own seat.
 
 For the replay test also copy `ship/replay.hoon` to `<pier>/base/gen/replay.hoon`
 and `test/poker-work.txt` to `<pier>/base/bench/poker-work.txt`.

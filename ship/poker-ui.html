@@ -117,10 +117,10 @@
 <script>
 const $ = id => document.getElementById(id);
 const SUIT = { c: '♣', d: '♦', h: '♥', s: '♠' };
-const hostingLogin = false;
+let hostingLogin = true;
 let ship, polling = false, sessionRevision = 0;
 let token = null;
-if (!hostingLogin) {
+function loadTabToken() {
   try { token = sessionStorage.getItem('poker-token'); } catch (e) {}
   if (!token) {
     token = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
@@ -388,6 +388,21 @@ function renderBar(v) {
 
 async function start() {
   render();
+  try {
+    const r = await fetch('/poker/auth/session', { cache: 'no-store', signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error();
+    const session = await r.json();
+    if (session.standalone === true) {
+      hostingLogin = false;
+      loadTabToken();
+    } else if (session.ship === null || typeof session.ship === 'string') {
+      setShip(session.ship);
+    } else throw new Error();
+  } catch {
+    $('you').textContent = 'Could not connect to the table. Retrying…';
+    setTimeout(start, 2500);
+    return;
+  }
   if (hostingLogin) {
     $('how-to-join').textContent = 'Sign in with Tlon to play with your ship.';
     $('logout').onclick = async () => {
@@ -399,12 +414,8 @@ async function start() {
       } catch { $('err').textContent = 'Could not sign out. Try again.'; }
       finally { $('logout').disabled = false; }
     };
-    try {
-      const r = await fetch('/poker/auth/session', { cache: 'no-store' });
-      if (!r.ok) throw new Error();
-      setShip((await r.json()).ship);
-    } catch { setShip(null); }
   }
+  render();
   poll(); setInterval(() => { if (!sending) poll(); }, 600);
 }
 start();
