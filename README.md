@@ -60,7 +60,7 @@ and ship access code stay at Hosting. Spectators can watch without a login.
 
 ### Set up one staging table
 
-1. Install the files under **Run it on a ship**. Choose a dedicated dealer
+1. Install the desk under **Host a table**. Choose a dedicated dealer
    with a stable, publicly accessible HTTPS origin. The player can use any
    ship listed on their staging Hosting account.
 2. Have the staging Hosting operator enable the issuer at
@@ -168,21 +168,44 @@ Then on the ship run `+replay %poker %poker-work %gent` and compare its
 `[length fingerprint]` pairs with `poker-ref.json`. The replay answers the
 entropy import with the same fixed value Node uses.
 
-## Run it on a ship
+## Host a table
 
-With the `%base` desk mounted:
+Run this in the host ship's Dojo, substituting the distributing ship's name
+for `~publisher`:
+
+```hoon
+|install ~publisher %poker
+```
+
+Once the desk is installed, open `https://<your-ship-host>/poker`. Share
+that URL with players. They can pick nicknames, sit down and play from their
+browsers. Each ship that installs the desk runs its own table, with its own
+seats, deck and game state. The release targets the Zuse Kelvin recorded
+in the distributor's `sys.kelvin` file and needs a runtime with urwasm.
+
+## Build the publishing desk
+
+On a development or distributing ship, stage the app and the packaging
+generator on a mounted `%base` desk:
 
 ```
 ship/poker-web.hoon  ->  <pier>/base/lib/poker-web.hoon
 ship/poker-oidc.hoon ->  <pier>/base/lib/poker-oidc.hoon
 ship/poker.hoon      ->  <pier>/base/app/poker.hoon
+ship/poker-desk.hoon ->  <pier>/base/gen/poker-desk.hoon
 poker.wasm           ->  <pier>/base/bench/poker.wasm
 ship/poker-ui.html   ->  <pier>/base/bench/poker-ui.html
 ```
 
-Then `|commit %base` and `|start %poker`, and open `http://<ship>/poker`. Each
-browser tab is one player in standalone mode. Once configured for OIDC, each
-verified ship has its own seat.
+Run `|commit %base` and then `:hood +poker-desk` in Dojo. The generator
+assembles a separate `%poker` desk containing the game, the Wasm and
+cryptography libraries it imports, and the Clay marks needed by those files.
+Its `desk.bill` starts the poker agent when someone installs the desk on
+their own ship. The generator also accepts an existing matching
+`|new-desk %poker` skeleton and refuses to overwrite divergent files.
+
+Run `|public %poker` on the distributor so other ships can fetch the desk.
+Share `|install ~publisher %poker` using the distributor's actual ship name.
 
 For the replay test also copy `ship/replay.hoon` to `<pier>/base/gen/replay.hoon`
 and `test/poker-work.txt` to `<pier>/base/bench/poker-work.txt`.
@@ -193,7 +216,7 @@ and `test/poker-work.txt` to `<pier>/base/bench/poker-work.txt`.
 - Browsers poll about twice a second; there is no live push.
 - In standalone mode the page is served without login. Fine on a local test ship; think before
   putting it on a ship that matters.
-- Tested on a local fake ship only.
+- The guest game has also been played in two browsers on a Tlon-hosted staging ship.
 
 ## Two notes on the runtime
 
