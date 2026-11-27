@@ -49,8 +49,8 @@ const server = createServer(async (req, res) => {
     res.statusCode = 400; res.end('{"error":"invalid_grant"}');
   }
 });
-function request(path, cookie = '', method = 'GET', body, origin = dealer) {
-  return fetch(dealer + path, { method, body, headers: { cookie, origin }, redirect: 'manual', signal: AbortSignal.timeout(35000) });
+function request(path, cookie = '', method = 'GET', body, origin = dealer, headers = {}) {
+  return fetch(dealer + path, { method, body, headers: { cookie, origin, ...headers }, redirect: 'manual', signal: AbortSignal.timeout(35000) });
 }
 async function beginLogin(ship, valid) {
   const start = await request('/poker/auth/start');
@@ -102,10 +102,11 @@ async function cancelWhileLoadingKeys() {
   assert.ok(codes.has(code), 'the cancelled login did not redeem its code');
 }
 const poll = async cookie => (await request('/poker/poll', cookie, 'POST', '')).json();
-async function move(cookie, action) {
-  const response = await request('/poker/api', cookie, 'POST', JSON.stringify(action));
+async function move(cookie, action, headers) {
+  const response = await request('/poker/api', cookie, 'POST', JSON.stringify(action), dealer, headers);
   assert.equal(response.status, 200);
   const answer = await response.json(); assert.equal(answer.ok, true, answer.error);
+  return answer;
 }
 const players = [];
 try {
@@ -121,8 +122,9 @@ try {
     await move(cookie, { op: 'join', name: 'ignored', token: '0'.repeat(32) });
     players.push(cookie);
   }
-  await move(players[0], { op: 'deal' });
+  const dealt = await move(players[0], { op: 'deal', token: '0'.repeat(32) }, { 'X-Poker-View': '1' });
   const [a, b, spectator] = await Promise.all([...players, ''].map(poll));
+  assert.deepEqual(dealt, { ok: true, ...a }, 'the response uses the authenticated seat, ignoring the supplied token');
   assert.deepEqual([a.view.you, b.view.you, spectator.view.you], [0, 1, null]);
   assert.equal((await request('/poker/disconnect', players[0], 'POST', '')).status, 404,
     'the guest departure endpoint is disabled at signed-in tables');

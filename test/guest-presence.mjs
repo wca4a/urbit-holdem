@@ -8,9 +8,9 @@ const dealer = new URL('http://127.0.0.1');
 dealer.port = process.argv[2] || '34721';
 const players = Array.from({ length: 4 }, () => randomBytes(16).toString('hex'));
 const spectator = '0'.repeat(32);
-const post = async (route, data) => {
+const post = async (route, data, headers) => {
   const res = await fetch(new URL('/poker/' + route, dealer), {
-    method: 'POST', body: data, signal: AbortSignal.timeout(10000),
+    method: 'POST', body: data, headers, signal: AbortSignal.timeout(10000),
   });
   assert.equal(res.status, 200);
   return res.json();
@@ -19,7 +19,7 @@ const poll = async token => (await post('poll', token)).view;
 const disconnect = token => post('disconnect', token);
 async function move(token, action) {
   const result = await post('api', JSON.stringify({ token, ...action }));
-  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(result, { ok: true }, 'legacy move response');
 }
 
 async function until(deadline, check, message) {
@@ -37,7 +37,14 @@ try {
   for (const [i, token] of players.slice(0, 3).entries()) {
     await move(token, { op: 'join', name: 'Presence ' + i });
   }
-  await move(players[0], { op: 'deal' });
+  const withView = { 'X-Poker-View': '1' };
+  const dealResult = await post('api', JSON.stringify({ op: 'deal', token: players[0] }), withView);
+  assert.deepEqual(dealResult, { ok: true, ...await post('poll', players[0]) });
+  assert.equal(dealResult.view.you, 0);
+  assert.ok(dealResult.view.seats[0].cards.every(card => /^[2-9TJQKA][cdhs]$/.test(card)));
+  assert.deepEqual(dealResult.view.seats[1].cards, ['??', '??']);
+  const refusedDeal = await post('api', JSON.stringify({ op: 'deal', token: players[0] }), withView);
+  assert.deepEqual(refusedDeal, { ok: false, error: 'a hand is already being played' });
   const deal = await poll(spectator);
   await move(players[deal.to_act], { op: 'act', action: 'call' });
   const initial = await poll(spectator);

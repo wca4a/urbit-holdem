@@ -41,8 +41,10 @@ Every reply is a few lines of text:
 
 The agent keeps lines 2 and 3 in a map keyed by token. At a signed-in table
 the dealer picks the token from the player's session and returns that player's
-view. Standalone guest tabs supply their own tokens. Polling does not run Wasm, so idle players cost
-nothing in the engine.
+view. Standalone guest tabs supply their own tokens. The first poll returns
+the table and the browser's player identity together. On a move, the browser
+sends `X-Poker-View: 1` to get its updated view in the same reply. Other
+players see the move on their next poll. Polls read the cached views.
 
 Rules covered: up to 8 seats, blinds of 5 and 10, 1,000 starting chips, minimum
 raises, all-ins, side pots, split pots with odd chips, joining and leaving
@@ -226,7 +228,7 @@ and `test/poker-work.txt` to `<pier>/base/bench/poker-work.txt`.
 
 - A connected player can take as long as they like on their turn. Signed-in
   ships keep their seats across disconnects.
-- Browsers poll about twice a second; there is no live push.
+- Browsers poll about twice a second and keep at most one poll in flight.
 - In standalone mode the page is served without login. Fine on a local test ship; think before
   putting it on a ship that matters.
 - The guest game has also been played in two browsers on a Tlon-hosted staging ship.

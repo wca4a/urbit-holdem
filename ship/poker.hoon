@@ -1,7 +1,7 @@
 ::  %poker: a hold'em table (bench/poker.wasm) running in urwasm
 ::
 ::    GET  /poker         the web page (bench/poker-ui.html)
-::    POST /poker/api     one JSON request (join, deal, act, ...), JSON answer
+::    POST /poker/api     one move; X-Poker-View: 1 includes the caller's view on success
 ::    POST /poker/poll    private view for the session (tab token in standalone)
 ::    POST /poker/disconnect  short reconnect window for a closing guest tab
 ::    GET  /poker/auth/*  native OIDC sign-in and session lookup
@@ -321,7 +321,7 @@
       =/  due  (~(get by guests) q.body)
       :_  ?~(due this this(guests (~(put by guests) q.body (min u.due (add now.bowl ~s20)))))
       (json-out eid 200 '{"ok":true}')
-    ?:  =('/poker/api' url)   (play eid body)
+    ?:  =('/poker/api' url)   (play eid body header-list.request.req ~)
     ?:  =('/poker/reset' url)
       :_  this(sed `(new-seed bowl), ver +(ver), views ~, guests ~)
       (json-out eid 200 '{"ok":true}')
@@ -345,7 +345,7 @@
   ?~  who  [(json-out eid 401 '{"error":"sign in to play"}') this]
   =/  move  (move:web body token u.who)
   ?~  move  [(json-out eid 400 '{"error":"invalid move"}') this]
-  (play eid u.move)
+  (play eid u.move header-list.request.req [~ token u.who])
 ++  ship-json
   |=  who=(unit @p)
   ^-  @t
@@ -360,26 +360,33 @@
   ?~  row  ~
   ?:  (gte now.bowl expires.u.row)  ~
   `who.u.row
+++  table-json
+  |=  [token=@t who=(unit @p) moved=?]
+  ^-  @t
+  =/  mine  (fall (~(get by views) token) (fall (~(get by views) spectator) 'null'))
+  =/  extra  ?~(cfg '' (cat 3 ',"ship":' (ship-json who)))
+  (rap 3 ~['{' ?:(moved '"ok":true,' '') '"v":' (crip (a-co:co ver)) ',"view":' mine extra '}'])
 ++  poll
   |=  [eid=@ta token=@t who=(unit @p)]
   ^-  (quip card _this)
-  =/  mine  (fall (~(get by views) token) (fall (~(get by views) spectator) 'null'))
-  =/  extra  ?~(cfg '' (cat 3 ',"ship":' (ship-json who)))
-  =/  out  (rap 3 ~['{"v":' (crip (a-co:co ver)) ',"view":' mine extra '}'])
   =?  guests  (~(has by guests) token)
     (~(put by guests) token (idle-deadline now.bowl))
-  [(json-out eid 200 out) this]
+  [(json-out eid 200 (table-json token who |)) this]
 ++  play
-  |=  [eid=@ta body=octs]
+  |=  [eid=@ta body=octs headers=header-list:http actor=(unit [token=@t who=@p])]
   ^-  (quip card _this)
-  =/  [answer=@t next=state-3]  (apply-move this body bowl)
-  :-  (json-out eid 200 answer)
-  ?:  |(?=(^ cfg) !=(answer '{"ok":true}'))  next
-  =/  cmd  (guest-command body)
-  ?~  cmd  next
-  ?.  (~(has by guests.next) token.u.cmd)  next
-  ?:  =('leave' op.u.cmd)  next(guests (~(del by guests.next) token.u.cmd))
-  next(guests (~(put by guests.next) token.u.cmd (idle-deadline now.bowl)))
+  =^  answer  state  (apply-move this body bowl)
+  ?.  =(answer '{"ok":true}')  [(json-out eid 200 answer) this]
+  =/  cmd  ?~(actor (guest-command body) ~)
+  =.  guests
+    ?~  cmd  guests
+    ?.  (~(has by guests) token.u.cmd)  guests
+    ?:  =('leave' op.u.cmd)  (~(del by guests) token.u.cmd)
+    (~(put by guests) token.u.cmd (idle-deadline now.bowl))
+  =?  answer  (lien headers |=(h=[@t @t] =(h ['x-poker-view' '1'])))
+    ?^  actor  (table-json token.u.actor `who.u.actor &)
+    (table-json ?~(cmd spectator token.u.cmd) ~ &)
+  [(json-out eid 200 answer) this]
 ::  One Behn timer covers every guest. An existing earlier wake can safely
 ::  recheck renewed leases and then schedule the new earliest deadline.
 ++  schedule-guests
