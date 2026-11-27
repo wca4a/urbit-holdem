@@ -16,6 +16,8 @@ the ship did not pick or change the cards.
 | `engine/` | The game: rules, hand ranking, pots, per-player views. Rust, depends only on serde and serde_json. |
 | `poker.wasm` | A prebuilt copy of the engine (about 300 KB). |
 | `ship/poker.hoon` | Gall agent: serves the page, runs the engine in urwasm, keeps each player's view. |
+| `ship/poker-oidc.hoon` | Builds the hosting authorization and token requests and verifies the signed ship identity. |
+| `ship/poker-web.hoon` | Reads the dealer session cookie and binds moves and private views to the player's seat. |
 | `ship/poker-ui.html` | The table page. One plain HTML file, no build step. |
 | `ship/replay.hoon` | Generator that feeds a file of recorded requests to the engine on a ship, for testing. |
 | `test/mkpoker.mjs` | Bots play against the engine in Node and record every request they make. |
@@ -37,13 +39,61 @@ Every reply is a few lines of text:
 2. one line per seated player: their 32-character secret token, then the table as that player may see it
 3. one line for spectators
 
-The agent keeps lines 2 and 3 in a map keyed by token. A browser polls with its
-token and gets its own line. Polling does not run Wasm, so idle players cost
-nothing in the engine.
+The agent keeps lines 2 and 3 in a map keyed by token. At a signed-in table
+the dealer picks the token from the player's session and returns that player's
+view. Standalone guest tabs supply their own tokens. The first poll returns
+the table and the browser's player identity together. On a move, the browser
+sends `X-Poker-View: 1` to get its updated view in the same reply. Other
+players see the move on their next poll. Polls read the cached views.
 
 Rules covered: up to 8 seats, blinds of 5 and 10, 1,000 starting chips, minimum
 raises, all-ins, side pots, split pots with odd chips, joining and leaving
 mid-hand, buying back in.
+
+## Sign in to a dealer ship with Tlon
+
+Open `https://<dealer-host>/poker`. The dealer ship's Eyre endpoint serves the
+page, receives game actions and returns each player's view. **Sign in with
+Tlon to play** opens the hosting site. Complete the usual hosting login if
+needed, select an owned ship, and approve the return to this dealer. The
+dealer handles `/poker/auth/callback`, exchanges the code through Iris, and
+checks the signed ID token before creating a table session. The hosting OTP
+and ship access code stay at Hosting. Spectators can watch without a login.
+
+### Set up one staging table
+
+1. Install the desk under **Host a table**. Choose a dedicated dealer
+   with a stable, publicly accessible HTTPS origin. The player can use any
+   ship listed on their staging Hosting account.
+2. Have the staging Hosting operator enable the issuer at
+   `https://test.tlon.systems/v1/oidc` and register a confidential client
+   for this dealer. Register **exactly**
+   `https://<dealer-host>/poker/auth/callback`. Use authorization code flow,
+   PKCE S256, the `openid ship` scopes and `client_secret_basic`. Give the
+   dealer operator the registered client ID and secret privately.
+3. With an empty table, enable sign-in in the dealer's local Dojo. Substitute
+   the real values in this command. Use origins without a trailing slash.
+
+   ```hoon
+   :poker &noun [%oidc 'https://<dealer-host>' 'https://test.tlon.systems/v1/oidc' '<client-id>' '<client-secret>']
+   ```
+
+4. Open the dealer's `/poker` in a signed-out browser and check that it opens
+   as a spectator. Choose **Sign in with Tlon to play** and select your
+   staging ship at Hosting. Check that the browser returns to the dealer's origin,
+   the seat shows the selected ship, and signing out and back in restores
+   that ship's seat. A second player should see only their own hole cards.
+
+The dealer talks to the Tlon issuer's fixed `/auth`, `/token` and `/jwks`
+paths. The token exchange and signature checks run on the dealer. Each dealer
+has its own client registration and table sessions. Keep the registered
+secret, Dojo history and pier private. Exclude callback query strings from
+HTTP access logs.
+
+An upgrade preserves an existing game. If the previous version required a
+gateway key, the upgraded table stays closed until the operator configures
+OIDC. To retire an old table and clear its hands and seats deliberately, run
+`:poker &noun %reset` in the dealer's Dojo before configuring the issuer.
 
 ## The sealed deck
 
@@ -100,6 +150,17 @@ cd test
 node verify.mjs 300      # the page's checker against 300 bot hands, then against six kinds of tampering
 ```
 
+To check the native login helpers on a mounted disposable ship, copy
+`test/poker-web-check.hoon` to `<pier>/base/gen/poker-web-check.hoon`. Run
+`node test/oidc-verifier.mjs > <pier>/base/gen/test-poker-oidc.hoon` to generate
+fresh signed token fixtures. After `|commit %base`, run `+poker-web-check` and
+`+test-poker-oidc` in Dojo. To exercise the full HTTP callback and play a hand
+with two test identities, configure an empty disposable dealer using the
+command at the top of `test/native-login.mjs` and run `node test/native-login.mjs`.
+
+Run `node test/guest-presence.mjs <port>` against an empty local guest table
+to check reconnects, automatic folding and the two-minute timeout.
+
 To compare a ship against Node:
 
 ```sh
@@ -112,29 +173,65 @@ Then on the ship run `+replay %poker %poker-work %gent` and compare its
 `[length fingerprint]` pairs with `poker-ref.json`. The replay answers the
 entropy import with the same fixed value Node uses.
 
-## Run it on a ship
+## Host a table
 
-With the `%base` desk mounted:
+Run this in the host ship's Dojo, substituting the distributing ship's name
+for `~publisher`:
+
+```hoon
+|install ~publisher %poker
+```
+
+Once the desk is installed, open `https://<your-ship-host>/poker`. Share
+that URL with players. They can pick nicknames, sit down and play from their
+browsers. Each ship that installs the desk runs its own table, with its own
+seats, deck and game state. The release targets the Zuse Kelvin recorded
+in the distributor's `sys.kelvin` file and needs a runtime with urwasm.
+
+When the dealer receives a guest's tab-close notice, it gives them 20 seconds
+to reconnect.
+Refreshing or restoring a tab with the same guest token during that window
+keeps the seat and cards. If the browser stops polling without reporting a
+close, the dealer waits about two minutes after the last contact. Once the
+guest times out, the dealer folds their active hand. Chips already in the
+pot stay there. A seat is freed immediately between hands or when the
+current hand settles. The **Leave table** button skips the reconnect window.
+
+## Build the publishing desk
+
+On a development or distributing ship, stage the app and the packaging
+generator on a mounted `%base` desk:
 
 ```
+ship/poker-web.hoon  ->  <pier>/base/lib/poker-web.hoon
+ship/poker-oidc.hoon ->  <pier>/base/lib/poker-oidc.hoon
 ship/poker.hoon      ->  <pier>/base/app/poker.hoon
+ship/poker-desk.hoon ->  <pier>/base/gen/poker-desk.hoon
 poker.wasm           ->  <pier>/base/bench/poker.wasm
 ship/poker-ui.html   ->  <pier>/base/bench/poker-ui.html
 ```
 
-Then `|commit %base` and `|start %poker`, and open `http://<ship>/poker`. Each
-browser tab is one player (the token lives in the tab's session storage).
+Run `|commit %base` and then `:hood +poker-desk` in Dojo. The generator
+assembles a separate `%poker` desk containing the game, the Wasm and
+cryptography libraries it imports, and the Clay marks needed by those files.
+Its `desk.bill` starts the poker agent when someone installs the desk on
+their own ship. The generator also accepts an existing matching
+`|new-desk %poker` skeleton and refuses to overwrite divergent files.
+
+Run `|public %poker` on the distributor so other ships can fetch the desk.
+Share `|install ~publisher %poker` using the distributor's actual ship name.
 
 For the replay test also copy `ship/replay.hoon` to `<pier>/base/gen/replay.hoon`
 and `test/poker-work.txt` to `<pier>/base/bench/poker-work.txt`.
 
 ## Known limits
 
-- No turn timer: if a player walks away mid-hand, the table waits for them.
-- Browsers poll about twice a second; there is no live push.
-- The page is served without login. Fine on a local test ship; think before
+- A connected player can take as long as they like on their turn. Signed-in
+  ships keep their seats across disconnects.
+- Browsers poll about twice a second and keep at most one poll in flight.
+- In standalone mode the page is served without login. Fine on a local test ship; think before
   putting it on a ship that matters.
-- Tested on a local fake ship only.
+- The guest game has also been played in two browsers on a Tlon-hosted staging ship.
 
 ## Two notes on the runtime
 

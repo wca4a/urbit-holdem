@@ -280,7 +280,11 @@ impl Table {
                     return Err("bad token".into());
                 }
                 if self.seat_of(&token).is_some() { return Err("you are already seated".into()); }
-                let name: String = name.chars().filter(|c| !c.is_control()).collect::<String>().trim().chars().take(16).collect();
+                // Hosted seats use the full ship name (moons can exceed the nickname limit).
+                let ship_label = name.strip_prefix('~').is_some_and(|rest|
+                    !rest.is_empty() && rest.bytes().all(|c| c.is_ascii_lowercase() || c == b'-'));
+                let limit = if ship_label { 128 } else { 16 };
+                let name: String = name.chars().filter(|c| !c.is_control()).collect::<String>().trim().chars().take(limit).collect();
                 if name.is_empty() { return Err("pick a name".into()); }
                 let free = (0..SEATS).find(|i| self.seats[*i].is_none()).ok_or("the table is full")?;
                 self.seats[free] = Some(Seat { token, name: name.clone(), chips: BUY_IN, ..Default::default() });
